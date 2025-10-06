@@ -2,17 +2,24 @@ package characters;
 
 public abstract class Actor {
     private final ActorType type;
-    private final String name;
+    private String name;
 
     // Core attributes (example set — extend as needed)
     private int strength;
     private int agility;
     private int intellect;
     private int vitality;
+    private boolean canBuildWalls;
+    private String equipment = "Sword";
+    private boolean hasSword = true;       // footmen default to sword
+    private boolean hasShortBow = false;   // opt-in
 
     // Movement speed in cells per second
     private double movement;
-
+    public Actor(ActorType type) {
+        // optionally initialize defaults
+        this.type = type;
+    }
     protected Actor(ActorType type, String name,
                     int strength, int agility, int intellect, int vitality,
                     double movement) {
@@ -24,10 +31,24 @@ public abstract class Actor {
         this.vitality = vitality;
         this.movement = movement;
     }
+    // in characters.Actor (or Human)
+    // --- name + type ---
 
+    // in characters.Actor
+    // default
+    // --- Equipment flags ---
+    public boolean hasSword() { return hasSword; }
+    public void setHasSword(boolean v) { hasSword = v; }
+
+    public boolean hasShortBow() { return hasShortBow; }
+    public void setHasShortBow(boolean v) { hasShortBow = v; }
+    public String getEquipment() { return equipment; }
+    public void setEquipment(String equipment) { this.equipment = equipment; }
+    public boolean canBuildWalls() { return canBuildWalls; }
+    public void setCanBuildWalls(boolean v) { this.canBuildWalls = v; }
     public ActorType getType() { return type; }
     public String getName() { return name; }
-
+    public void setName(String name) { this.name = name; }
     public int getStrength()  { return strength;  }
     public int getAgility()   { return agility;   }
     public int getIntellect() { return intellect; }
