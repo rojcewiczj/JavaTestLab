@@ -4,6 +4,7 @@ import characters.Actor;
 import characters.Human;
 import characters.Team;
 import characters.Unit;
+import intelligence.TeamSightings;
 
 import java.awt.*;
 import java.util.*;
@@ -45,6 +46,18 @@ public class World {
     // quick helper: check if a tile is inside any 2×2 tree
     // World.java: fields
     private boolean[][] treeMask;  // [height][width]
+    // world/World.java
+    private characters.Team playerVisionTeam = characters.Team.RED;
+
+    public characters.Team getPlayerVisionTeam() { return playerVisionTeam; }
+    private final TeamSightings teamSightings = new TeamSightings();
+
+    public java.util.Map<Integer, TeamSightings.Sighting> getSightingsForTeam(characters.Team t) {
+        return teamSightings.view(t);
+    }
+    public void setPlayerVisionTeam(characters.Team t) {
+        playerVisionTeam = (t == null ? characters.Team.RED : t);
+    }
 
     // call when world is constructed (or whenever size known)
     private void initMasks() {
@@ -87,14 +100,19 @@ public class World {
             rebuildOpaqueMask();
             worldMap.add(row);
         }
+        teamSightings.setTtlSeconds(10.0);
     }
     /** A tile blocks vision if any static blocker occupies it. */
-    public void rebuildOpaqueMask() {
-        for (int r=0;r<height;r++) {
-            for (int c=0;c<width;c++) {
-                // trees: 2x2 blocks -> your existing mask
-                boolean op = treeMask[r][c] || buildingMask[r][c];
-                // you might choose: farms are low (not opaque), barns/camps are opaque.
+    private void rebuildOpaqueMask() {
+        for (int r = 0; r < height; r++) {
+            for (int c = 0; c < width; c++) {
+                boolean op = false;
+                if (treeMask[r][c]) op = true;
+                if (buildingMask[r][c]) {
+                    // If you want some buildings (e.g., FARM) not to block, keep a per-cell
+                    // building type map. Otherwise, treat any buildingMask as opaque:
+                    op = true;
+                }
                 opaque[r][c] = op;
             }
         }
@@ -107,19 +125,61 @@ public class World {
     // --- Fog arrays accessors for renderer ---
     public boolean isVisible(int r, int c)  { return inBoundsRC(r,c) && visible[r][c]; }
     public boolean isExplored(int r, int c) { return inBoundsRC(r,c) && explored[r][c]; }
+    // world/World.java
+    public boolean addHuntingCamp(int top, int left, Team team) {
+        if (!canPlaceBuilding(Building.Type.HUNTING_CAMP,top, left)) return false;
+        var b = new Building(Building.Type.HUNTING_CAMP, top, left, team);
+        buildings.add(b);
+        stampBuilding(b.getRow(), b.getCol(), b.getType().h, b.getType().w, true);
+//        rebuildOpaqueMask();                 // single rebuild here
+        return true;
+    }
+    // Returns a walkable perimeter tile around the building (row,col), nearest to 'u'.
+// Prefers tiles that are in-bounds and not blocked for 'u'.
+    public int[] findApproachTileForBuilding(Building b, characters.Unit u) {
+        int top = b.getRow(), left = b.getCol();
+        int h = b.getType().h, w = b.getType().w;
+
+        int bestR = -1, bestC = -1;
+        double best = Double.POSITIVE_INFINITY;
+
+        // One-tile border ring around the rectangle [top..top+h-1, left..left+w-1]
+        for (int r = top - 1; r <= top + h; r++) {
+            for (int c = left - 1; c <= left + w; c++) {
+                boolean onPerim = (r == top - 1 || r == top + h || c == left - 1 || c == left + w);
+                if (!onPerim) continue;
+                if (!inBoundsRC(r, c)) continue;
+                if (isBlocked(r, c, u)) continue;
+
+                double dr = r - u.getY(), dc = c - u.getX();
+                double d2 = dr*dr + dc*dc;
+                if (d2 < best) { best = d2; bestR = r; bestC = c; }
+            }
+        }
+        if (bestR == -1) return null; // fully surrounded / no access
+        return new int[]{ bestR, bestC };
+    }
+
 
     /** Call once per tick before painting. */
     public void computeVisibility() {
         // clear current visibility
         for (int r = 0; r < height; r++) java.util.Arrays.fill(visible[r], false);
 
-        for (characters.Unit u : units) applyUnitFOVShadow(u);
+        // Only units on the player’s vision team contribute to visibility
+        for (characters.Unit u : units) {
+            if (u.getTeam() != playerVisionTeam) continue;       // <-- ignore enemies/neutral (e.g., deer)
+            applyUnitFOVShadow(u);
+        }
 
         // explored := explored OR visible
         for (int r = 0; r < height; r++)
             for (int c = 0; c < width;  c++)
                 if (visible[r][c]) explored[r][c] = true;
-
+        long nowNanos = System.nanoTime();
+// Record deer seen by the PLAYER’s vision team (you already restrict FOV to that team)
+        teamSightings.updateDeerFromVisibility(this, playerVisionTeam, nowNanos);
+        teamSightings.expireOld(playerVisionTeam, nowNanos);
         // NEW: compute feather distances (blocked by opaque)
         computeFogFeatherDistances(3); // feather radius in tiles; tweak 2–4
     }
@@ -341,6 +401,8 @@ public class World {
             }
         }
     }
+    // World.java
+
 
     public boolean canPlaceBuilding(Building.Type type, int topRow, int leftCol) {
         for (int r = topRow; r < topRow + type.h; r++) {
@@ -374,13 +436,14 @@ public class World {
         if (!canPlaceBuilding(Building.Type.HOUSE, topRow, leftCol)) return false;
         buildings.add(new Building(Building.Type.HOUSE, topRow, leftCol, team));
         stampBuilding(topRow, leftCol, Building.Type.HOUSE.h, Building.Type.HOUSE.w, true);
+//        rebuildOpaqueMask();
         return true; // spawning handled in trySpawnArrivalsForHouses()
     }
 
     public boolean addFarm(int topRow, int leftCol, characters.Team team) {
         if (!canPlaceBuilding(Building.Type.FARM, topRow, leftCol)) return false;
         buildings.add(new Building(Building.Type.FARM, topRow, leftCol, team));
-//        stampBuilding(topRow, leftCol, Building.Type.FARM.h, Building.Type.FARM.w, true);
+        stampBuilding(topRow, leftCol, Building.Type.FARM.h, Building.Type.FARM.w, true);
         return true;
     }
 
@@ -388,7 +451,7 @@ public class World {
         if (!canPlaceBuilding(Building.Type.BARN, topRow, leftCol)) return false;
         buildings.add(new Building(Building.Type.BARN, topRow, leftCol, team));
         stampBuilding(topRow, leftCol, Building.Type.BARN.h, Building.Type.BARN.w, true);
-
+//        rebuildOpaqueMask();
         return true;
     }
     public boolean addLoggingCamp(int topRow, int leftCol, characters.Team team) {
@@ -396,6 +459,7 @@ public class World {
         buildings.add(new Building(Building.Type.LOGGING_CAMP, topRow, leftCol, team));
         // stamp to building mask for collision:
         stampBuilding(topRow, leftCol, Building.Type.LOGGING_CAMP.h, Building.Type.LOGGING_CAMP.w, true);
+//        rebuildOpaqueMask();
         return true;
     }
     // Return all control points that belong to tree patches (forests)
@@ -622,6 +686,47 @@ public class World {
         }
         return false;
     }
+
+    public boolean assignHunter(characters.Unit u, Building camp) {
+        // Must click a Hunting Camp owned by the same team
+        if (camp == null || camp.getType() != Building.Type.HUNTING_CAMP) return false;
+        if (u == null || u.getTeam() != camp.getTeam()) return false;
+
+        // If this unit was doing something else, clear that
+        interruptForManualControl(u); // safe to call even if not in an AI loop
+
+        // Put them into the hunter loop
+        u.setRole(characters.Unit.UnitRole.HUNTER);
+        u.setAssignedCamp(camp);
+        u.setHunterState(characters.Unit.HunterState.INIT); // HunterAI will GET_BOW next
+        // Keep hasBow as-is; if they already had one, AI will pass GET_BOW quickly
+        if (u.getAI() == null || !(u.getAI() instanceof intelligence.HunterAI)) {
+            u.setAI(new intelligence.HunterAI());
+        }
+
+        // Optional: stop any current manual path so they immediately start the loop
+        u.setPath(java.util.Collections.emptyList());
+
+        return true;
+    }
+
+    /** Called before issuing a manual player move (or any time you want to cancel job loops). */
+    public void interruptForManualControl(characters.Unit u) {
+        if (u == null) return;
+
+        // Cancel Hunter loop
+        if (u.getRole() == characters.Unit.UnitRole.HUNTER) {
+            u.setRole(characters.Unit.UnitRole.NONE);
+            u.setHunterState(characters.Unit.HunterState.IDLE);
+            // Keep their bow; the player may still want to shoot manually.
+        }
+
+        // (If you add other job loops later, clear them here similarly.)
+
+        // Stop any AI brain and current path so manual orders take over immediately
+        u.setAI(null);
+        u.setPath(java.util.Collections.emptyList());
+    }
     /** Try to mount: footman mounts horse (same team, adjacency). Returns true if success. */
     // In World
     public boolean mount(Unit footman, Unit horse) {
@@ -747,7 +852,29 @@ public class World {
     public void spawnArrow(double sx, double sy, double tx, double ty, double speedCellsPerSec) {
         arrows.add(new Arrow(sx, sy, tx, ty, speedCellsPerSec));
     }
+    // 4) Time & arrow visual (stubs if you don’t have them yet)
+    public double nowSeconds() { return System.nanoTime() / 1e9; }
 
+    // Tunable default arrow speed (tiles per second)
+    private static final double ARROW_SPEED_CPS = 14.0;
+
+    /** Fire an arrow with the default speed. */
+    public void fireArrowVisual(characters.Unit shooter, double tx, double ty) {
+        fireArrowVisual(shooter, tx, ty, ARROW_SPEED_CPS);
+    }
+
+    /** Fire an arrow with an explicit speed (tiles/sec). */
+    public void fireArrowVisual(characters.Unit shooter, double tx, double ty, double speedCellsPerSec) {
+        // Start slightly ahead of the shooter so the arrow doesn't overlap the unit
+        double nudge = 0.35; // tiles
+        double sx = shooter.getX() + Math.cos(shooter.getOrientRad()) * nudge;
+        double sy = shooter.getY() + Math.sin(shooter.getOrientRad()) * nudge;
+
+        // If target is essentially the same spot, don't spawn
+        if (Math.hypot(tx - sx, ty - sy) < 1e-4) return;
+
+        arrows.add(new Arrow(sx, sy, tx, ty, speedCellsPerSec));
+    }
     // Advance & prune arrows each tick
     public void updateArrows(double dt) {
         java.util.Iterator<Arrow> it = arrows.iterator();

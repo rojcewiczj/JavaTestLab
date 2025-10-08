@@ -9,7 +9,8 @@ public class Building {
         HOUSE(3, 3),
         FARM(4, 8),     // 4 high, 8 wide
         BARN(3, 4),    // 3 high, 4 wide
-        LOGGING_CAMP(3,4);
+        LOGGING_CAMP(3,4),
+        HUNTING_CAMP(3,4);
         public final int h, w;
         Type(int h, int w) { this.h = h; this.w = w; }
     }

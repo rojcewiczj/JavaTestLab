@@ -27,12 +27,16 @@ public class Unit {
     // NEW: path as queue of grid waypoints (row,col)
     private final Deque<Point> path = new ArrayDeque<>();
     // in characters/Unit.java
-    public enum UnitRole { NONE, LUMBER }
+    public enum UnitRole { NONE, LUMBER, HUNTER }
 
     public static enum LumberState {
         SEEK_TREE, MOVE_TO_TREE, CHOPPING, MOVE_TO_CAMP, IDLE
     }
-
+    // in characters.Unit (near your LumberState enum)
+    public enum HunterState { INIT, GET_BOW, SEARCH, MOVE_TO_SHOT, SHOOT, LOOT, RETURN_TO_CAMP, UNLOAD, IDLE }
+    // fields (put near other role-specific fields)
+    private HunterState hunterState = HunterState.IDLE;
+    private boolean hasBow = false;
     private UnitRole role = UnitRole.NONE;
     private LumberState lumberState = LumberState.IDLE;
     private world.Building assignedCamp;   // Logging camp assigned
@@ -79,7 +83,12 @@ public class Unit {
     }
     private long lastMoveNanos = System.nanoTime(); // updated whenever movement stops
     private int id; // set by World.spawnActor
-
+    private int meatCount = 0, hideCount = 0;
+    public int getMeatCount() { return meatCount; }
+    public int getHideCount() { return hideCount; }
+    public void addMeat(int n) { meatCount += Math.max(0, n); }
+    public void addHide(int n) { hideCount += Math.max(0, n); }
+    public void clearHuntLoot() { meatCount = 0; hideCount = 0; }
     public void setMounted(boolean v) { mounted = v; }
 
     public void setRider(Unit r) { rider = r; }
@@ -133,6 +142,12 @@ public class Unit {
 
     // how much turning reduces forward speed (0 = none, 1 = strong)
     private double turnSlowdownStrength = 0.85; // tweak to taste
+    // Hunter accessors
+    public HunterState getHunterState() { return hunterState; }
+    public void setHunterState(HunterState s) { hunterState = (s == null ? HunterState.IDLE : s); }
+
+    public boolean hasBow() { return hasBow; }
+    public void setHasBow(boolean v) { hasBow = v; }
 
     public void setTurnSlowdownStrength(double k) { turnSlowdownStrength = Math.min(Math.max(0.0, k), 1.0); }
     // getters/setters

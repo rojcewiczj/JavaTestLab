@@ -27,7 +27,7 @@ public class WorldPanel extends JPanel {
     // ... existing fields ...
     private JButton buildButton;
 
-    private enum BuildMode { NONE, PICK, WALL_PAINT, HOUSE_PLACE, FARM_PLACE, BARN_PLACE, LOGGING_CAMP_PLACE }
+    private enum BuildMode { NONE, PICK, WALL_PAINT, HOUSE_PLACE, FARM_PLACE, BARN_PLACE, LOGGING_CAMP_PLACE, HUNTING_CAMP_PLACE }
     private BuildMode buildMode = BuildMode.NONE;
 
     // for wall painting
@@ -138,6 +138,13 @@ public class WorldPanel extends JPanel {
             statusLabel.setText("Build: Logging Camp — right-click top-left to place (3×4), must touch a forest CP.");
         });
         buildMenu.add(loggingItem);
+
+        JMenuItem miHuntingCamp = new JMenuItem("Hunting Camp (3×4) — U");
+        miHuntingCamp.addActionListener(e -> {
+            buildMode = BuildMode.HUNTING_CAMP_PLACE;
+            statusLabel.setText("Place Hunting Camp (3×4): right-click to place. Select a builder first.");
+        });
+        buildMenu.add(miHuntingCamp);
         // Show the build palette when clicking the button
         buildButton.addActionListener(e -> {
             if (!buildButton.isEnabled()) return; // safety
@@ -225,6 +232,20 @@ public class WorldPanel extends JPanel {
                             else { statusLabel.setText("Can't place Logging Camp here (must touch a forest CP and avoid blockers)."); buildMode = BuildMode.NONE; }
                         }
                     }
+                    case HUNTING_CAMP_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) { statusLabel.setText("No builder selected."); buildMode = BuildMode.NONE; }
+                        else {
+                            if (world.addHuntingCamp(top, left, team)) {
+                                statusLabel.setText("Hunting Camp built.");
+                                buildMode = BuildMode.NONE;
+                                consumed = true;
+                            } else {
+                                statusLabel.setText("Can't place Hunting Camp here.");
+                                buildMode = BuildMode.NONE;
+                            }
+                        }
+                    }
                     case NONE -> { /* do nothing here; fall through to interaction/move */ }
                 }
 
@@ -244,6 +265,16 @@ public class WorldPanel extends JPanel {
                             return;
                         }
                     }
+                    // try assign hunter (only if clicked a hunting camp)
+                    if (selected != null && b != null
+                            && b.getType() == Building.Type.HUNTING_CAMP
+                            && selected.getTeam() == b.getTeam()) {
+                        if (world.assignHunter(selected, b)) {
+                            statusLabel.setText("Assigned " + selected.getActor().getName() + " as hunter.");
+                            updateStatus(row, col);
+                            return; // consume click
+                        }
+                    }
 
                     // try mount
                     characters.Unit clicked = world.getUnitAt(row, col);
@@ -256,18 +287,27 @@ public class WorldPanel extends JPanel {
                             return;
                         }
                     }
-
+                    for (characters.Unit u : world.getUnits()) {
+                        if (!u.isSelected()) continue;
+                        world.interruptForManualControl(u);
+                    }
                     // otherwise: normal move
                     moveSelectedToFanOut(row, col);
                 }
 
                 updateStatus(row, col);
             }
+            // In your panel class (the one with mousePressed)
             private characters.Team selectedBuilderTeamOrNull() {
+                characters.Team team = null;
                 for (characters.Unit u : world.getUnits()) {
-                    if (u.isSelected() && u.getActor().canBuildWalls()) return u.getTeam();
+                    if (!u.isSelected()) continue;
+                    if (team == null) team = u.getTeam();
+                    // If you want to forbid mixed-team selections:
+                    // else if (team != u.getTeam()) return null;
+                    return team; // first selected unit's team
                 }
-                return null;
+                return null; // nothing selected
             }
             @Override public void mouseReleased(MouseEvent e) {
                 // camera-aware mouse (only needed for right-click build branches)
@@ -782,9 +822,10 @@ public class WorldPanel extends JPanel {
             // Slight hue per type
             java.awt.Color fill = switch (b.getType()) {
                 case HOUSE -> base;
-                case FARM  -> new java.awt.Color(base.getRed(), Math.min(255, base.getGreen()+40), base.getBlue(), 180);
-                case BARN  -> new java.awt.Color(Math.min(255, base.getRed()+40), base.getGreen(), base.getBlue(), 200);
-                case LOGGING_CAMP -> new java.awt.Color(139, 101, 67, 190); // brown-ish for logging
+                case FARM  -> new Color(base.getRed(), Math.min(255, base.getGreen()+40), base.getBlue(), 180);
+                case BARN  -> new Color(Math.min(255, base.getRed()+40), base.getGreen(), base.getBlue(), 200);
+                case LOGGING_CAMP -> new Color(139, 101, 67, 190); // brown-ish for logging
+                case HUNTING_CAMP -> new Color(168, 142, 92, 190);
             };
 
             g2.setColor(fill);
@@ -796,13 +837,19 @@ public class WorldPanel extends JPanel {
 
             // tiny icon/text
             g2.setColor(java.awt.Color.BLACK);
-            String label = switch (b.getType()) { case HOUSE -> "H"; case FARM -> "F"; case BARN -> "B"; case LOGGING_CAMP -> "LC";};
+            String label = switch (b.getType()) {
+                case HOUSE         -> "H";
+                case FARM          -> "F";
+                case BARN          -> "B";
+                case LOGGING_CAMP  -> "LC";
+                case HUNTING_CAMP  -> "HC";   // <-- add this
+            };
             g2.drawString(label, x + 4, y + 14);
         }
         // Fog overlay (world space), after terrain/units/buildings
         final int FEATHER = 5;            // must match computeFogFeatherDistances(...)
-        final int ALPHA_MAX = 50;        // darkest grey for far unseen
-        final int ALPHA_MIN = 20;         // light veil right next to visible
+        final int ALPHA_MAX = 40;        // darkest grey for far unseen
+        final int ALPHA_MIN = 15;         // light veil right next to visible
 
         for (int r = firstRow; r <= lastRow; r++) {
             for (int c = firstCol; c <= lastCol; c++) {
