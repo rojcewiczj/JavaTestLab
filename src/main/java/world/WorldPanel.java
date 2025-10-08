@@ -27,7 +27,7 @@ public class WorldPanel extends JPanel {
     // ... existing fields ...
     private JButton buildButton;
 
-    private enum BuildMode { NONE, PICK, WALL_PAINT, HOUSE_PLACE }
+    private enum BuildMode { NONE, PICK, WALL_PAINT, HOUSE_PLACE, FARM_PLACE, BARN_PLACE, LOGGING_CAMP_PLACE }
     private BuildMode buildMode = BuildMode.NONE;
 
     // for wall painting
@@ -46,6 +46,12 @@ public class WorldPanel extends JPanel {
     private double panAccel = 2800;        // px/s^2 acceleration to target speed
     // keep these fields in WorldPanel
     private Point lastPaintedCell = null; // to avoid duplicates while painting
+    // --- FPS counter ---
+    private int frames = 0;
+    private long lastFpsTime = System.nanoTime();
+    private int currentFps = 0;
+    private double emaTickMs = 0, emaPaintMs = 0;
+    private static final double EMA = 0.1;
     // Camera / viewport
     private void updatePanFromMouse(int mx, int my) {
         // Horizontal target vel
@@ -97,6 +103,7 @@ public class WorldPanel extends JPanel {
         setFocusable(true);
         // Build button opens a tiny palette (only "Wall" for now)
         JPopupMenu buildMenu = new JPopupMenu();
+
         JMenuItem wallItem = new JMenuItem("Wall");
         wallItem.addActionListener(e -> {
             buildMode = BuildMode.WALL_PAINT;
@@ -104,103 +111,163 @@ public class WorldPanel extends JPanel {
             statusLabel.setText("Build: Wall — right-drag to paint, release to commit. ESC to cancel.");
         });
         buildMenu.add(wallItem);
-        // NEW: House 3x3
+
         JMenuItem houseItem = new JMenuItem("House (3x3)");
         houseItem.addActionListener(e -> {
             buildMode = BuildMode.HOUSE_PLACE;
-            statusLabel.setText("Build: House — right-click a tile to place 3×3. ESC to cancel.");
+            statusLabel.setText("Build: House — right-click to place (3×3).");
         });
         buildMenu.add(houseItem);
+
+        JMenuItem farmItem = new JMenuItem("Farm (4x8)");
+        farmItem.addActionListener(e -> {
+            buildMode = BuildMode.FARM_PLACE;
+            statusLabel.setText("Build: Farm — right-click top-left to place (4×8).");
+        });
+        buildMenu.add(farmItem);
+
+        JMenuItem barnItem = new JMenuItem("Barn (3x4)");
+        barnItem.addActionListener(e -> {
+            buildMode = BuildMode.BARN_PLACE;
+            statusLabel.setText("Build: Barn — right-click top-left to place (3×4).");
+        });
+        buildMenu.add(barnItem);
+        JMenuItem loggingItem = new JMenuItem("Logging Camp (3x4)");
+        loggingItem.addActionListener(e -> {
+            buildMode = BuildMode.LOGGING_CAMP_PLACE;
+            statusLabel.setText("Build: Logging Camp — right-click top-left to place (3×4), must touch a forest CP.");
+        });
+        buildMenu.add(loggingItem);
+        // Show the build palette when clicking the button
         buildButton.addActionListener(e -> {
-            if (buildMode == BuildMode.WALL_PAINT) { // toggling off
-                buildMode = BuildMode.NONE; paintPreview.clear(); repaint();
-                return;
-            }
+            if (!buildButton.isEnabled()) return; // safety
             buildMode = BuildMode.PICK;
+            // show the popup aligned under the button
             buildMenu.show(buildButton, 0, buildButton.getHeight());
         });
+
 
         // ESC cancels build mode
         setFocusable(true);
         registerKeyboardAction(_e -> {
             buildMode = BuildMode.NONE;
             paintPreview.clear();
-            repaint();
         }, KeyStroke.getKeyStroke("ESCAPE"), JComponent.WHEN_FOCUSED);
 
         // Mouse
         addMouseListener(new MouseAdapter() {
             @Override public void mousePressed(MouseEvent e) {
-
-                requestFocusInWindow(); // so ESC, etc. work
+                requestFocusInWindow();
 
                 final int mx = e.getX(), my = e.getY();
-                // camera-aware tile coords
                 final int col = (int) ((mx + camX) / cellSize);
                 final int row = (int) ((my + camY) / cellSize);
                 if (!inBounds(row, col)) return;
 
                 if (SwingUtilities.isLeftMouseButton(e)) {
                     if (buildMode == BuildMode.NONE) {
-                        // start drag in WORLD coords
-                        double wx = mx + camX;
-                        double wy = my + camY;
+                        double wx = mx + camX, wy = my + camY;
                         dragStartWorld = new java.awt.geom.Point2D.Double(wx, wy);
                         dragEndWorld   = new java.awt.geom.Point2D.Double(wx, wy);
                     }
-                } else if (SwingUtilities.isRightMouseButton(e)) {
-                    if (buildMode == BuildMode.WALL_PAINT) {
-                        // start painting walls in WORLD coords
-                        painting = true;
-                        lastPaintedCell = null; // reset painter trail
-                        Point p = new Point(col, row);
-                        if (paintPreview.isEmpty() || !paintPreview.get(paintPreview.size() - 1).equals(p)) {
-                            paintPreview.add(p);
-                        }
-                    } else if (buildMode == BuildMode.HOUSE_PLACE) {
-                        // find the team of the selected builder (fallback: no build if none)
-                        characters.Team team = null;
-                        for (characters.Unit u : world.getUnits()) {
-                            if (u.isSelected() && u.getActor().canBuildWalls()) { team = u.getTeam(); break; }
-                        }
-                        if (team == null) { statusLabel.setText("No builder selected."); repaint(); return; }
-
-                        // place top-left of 3x3 so the clicked cell becomes the center (row-1,col-1)
-                        int top = row - 1, left = col - 1;
-                        if (world.canPlaceHouse(top, left)) {
-                            world.addHouse(top, left, team);
-                            statusLabel.setText("House built. Arrivals en route.");
-                            buildMode = BuildMode.NONE;
-                            repaint();
-                        } else {
-                            statusLabel.setText("Can't place house here.");
-                        }
-                    }  else {
-                        // Try to mount if we right-clicked a friendly horse
-                        characters.Unit selected = null;
-                        for (characters.Unit u : world.getUnits()) {
-                            if (u.isSelected()) { selected = u; break; }
-                        }
-                        characters.Unit clicked = world.getUnitAt(row, col); // footprint-aware
-
-                        if (selected != null && clicked != null
-                                && clicked.getTeam() == selected.getTeam()
-                                && clicked.getActor() instanceof characters.Horse) {
-
-                            if (world.mount(selected, clicked)) {
-                                statusLabel.setText("Mounted: " + selected.getActor().getName());
-                                repaint();
-                                return; // don't issue a move if we mounted
-                            }
-                        }
-
-                        // normal move (fan-out)
-                        moveSelectedToFanOut(row, col);
-                    }
+                    updateStatus(row, col);
+                    return;
                 }
 
-                updateStatus(row, col); // world coords for hover text
-                repaint();
+                if (!SwingUtilities.isRightMouseButton(e)) {
+                    updateStatus(row, col);
+                    return;
+                }
+
+                boolean consumed = false; // did this right-click do something already?
+                characters.Team team;
+                int top = row, left = col;
+
+                // ===== BUILD / PAINT MODES =====
+                switch (buildMode) {
+                    case WALL_PAINT -> {
+                        painting = true;
+                        lastPaintedCell = null;
+                        paintPreview.clear();
+                        paintPreview.add(new Point(col, row));
+                        consumed = true;
+                    }
+                    case HOUSE_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) { statusLabel.setText("No builder selected."); buildMode = BuildMode.NONE; }
+                        else {
+                            top = row - 1; left = col - 1;
+                            if (world.addHouse(top, left, team)) { statusLabel.setText("House built."); buildMode = BuildMode.NONE; consumed = true; }
+                            else { statusLabel.setText("Can't place house here."); buildMode = BuildMode.NONE; }
+                        }
+                    }
+                    case FARM_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) { statusLabel.setText("No builder selected."); buildMode = BuildMode.NONE; }
+                        else {
+                            if (world.addFarm(top, left, team)) { statusLabel.setText("Farm built."); buildMode = BuildMode.NONE; consumed = true; }
+                            else { statusLabel.setText("Can't place farm here."); buildMode = BuildMode.NONE; }
+                        }
+                    }
+                    case BARN_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) { statusLabel.setText("No builder selected."); buildMode = BuildMode.NONE; }
+                        else {
+                            if (world.addBarn(top, left, team)) { statusLabel.setText("Barn built."); buildMode = BuildMode.NONE; consumed = true; }
+                            else { statusLabel.setText("Can't place barn here."); buildMode = BuildMode.NONE; }
+                        }
+                    }
+                    case LOGGING_CAMP_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) { statusLabel.setText("No builder selected."); buildMode = BuildMode.NONE; }
+                        else {
+                            if (world.addLoggingCamp(top, left, team)) { statusLabel.setText("Logging Camp built."); buildMode = BuildMode.NONE; consumed = true; }
+                            else { statusLabel.setText("Can't place Logging Camp here (must touch a forest CP and avoid blockers)."); buildMode = BuildMode.NONE; }
+                        }
+                    }
+                    case NONE -> { /* do nothing here; fall through to interaction/move */ }
+                }
+
+                // ===== IF NOT CONSUMED, DO INTERACTIONS/MOVE =====
+                if (!consumed) {
+                    characters.Unit selected = null;
+                    for (characters.Unit u : world.getUnits()) { if (u.isSelected()) { selected = u; break; } }
+
+                    // try assign lumber worker (only if clicked a camp)
+                    world.Building b = world.buildingAt(row, col);
+                    if (selected != null && b != null
+                            && b.getType() == Building.Type.LOGGING_CAMP
+                            && selected.getTeam() == b.getTeam()) {
+                        if (world.assignLumberWorker(selected, b)) {
+                            statusLabel.setText("Assigned " + selected.getActor().getName() + " as lumber worker.");
+                            updateStatus(row, col);
+                            return;
+                        }
+                    }
+
+                    // try mount
+                    characters.Unit clicked = world.getUnitAt(row, col);
+                    if (selected != null && clicked != null
+                            && clicked.getTeam() == selected.getTeam()
+                            && clicked.getActor() instanceof characters.Horse) {
+                        if (world.mount(selected, clicked)) {
+                            statusLabel.setText("Mounted: " + selected.getActor().getName());
+                            updateStatus(row, col);
+                            return;
+                        }
+                    }
+
+                    // otherwise: normal move
+                    moveSelectedToFanOut(row, col);
+                }
+
+                updateStatus(row, col);
+            }
+            private characters.Team selectedBuilderTeamOrNull() {
+                for (characters.Unit u : world.getUnits()) {
+                    if (u.isSelected() && u.getActor().canBuildWalls()) return u.getTeam();
+                }
+                return null;
             }
             @Override public void mouseReleased(MouseEvent e) {
                 // camera-aware mouse (only needed for right-click build branches)
@@ -213,7 +280,7 @@ public class WorldPanel extends JPanel {
                     applySelectionFromDragWorld(e.isShiftDown() || e.isControlDown());
                     dragStartWorld = null;
                     dragEndWorld   = null;
-                    repaint();               // remove rubber-band immediately
+                    // remove rubber-band immediately
                     return;
                 }
 
@@ -230,11 +297,9 @@ public class WorldPanel extends JPanel {
                     lastPaintedCell = null;
                     paintPreview.clear();
                     statusLabel.setText("Walls built.");
-                    repaint();
                     return;
                 }
 
-                repaint();
             }
         });
 
@@ -256,7 +321,6 @@ public class WorldPanel extends JPanel {
                 // Rubber-band selection (store pixel coords; apply using cam-adjusted tiles elsewhere)
                 if (dragStartWorld != null && buildMode == BuildMode.NONE) {
                     dragEndWorld = new java.awt.geom.Point2D.Double(mx + camX, my + camY);
-                    repaint();
                 }
 
 
@@ -278,96 +342,43 @@ public class WorldPanel extends JPanel {
                         }
                     }
                 }
-
-                repaint();
             }
         });
+        // --- replace Swing.Timer with this executor loop ---
+        java.util.concurrent.ScheduledExecutorService exec =
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+        lastNanos = System.nanoTime();
+        exec.scheduleAtFixedRate(() -> {
+            long now = System.nanoTime();
+            double dt = Math.min(0.05, (now - lastNanos) / 1_000_000_000.0);
+            lastNanos = now;
 
-        // 60 FPS timer (keep your existing tick)
-        new Timer(16, e -> tick()).start();
+            // UPDATE on this background thread
+            // UPDATE on this background thread
+            for (Unit u : world.getUnits()) {
+                u.update(dt);      // your usual physics/movement, etc.
+                u.tickAI(world, dt);  // <-- add this line
+            }
+            world.syncUnitsToLayer();
+            world.payIncome(dt);
+            world.processCombat(now / 1e9);
+            world.updateArrows(dt);
+            world.trySpawnArrivalsForHouses();
+            world.updateLumberJobs(dt);
+            world.computeVisibility();
+            // camera integration
+            camVX = approach(camVX, targetVX, panAccel * dt);
+            camVY = approach(camVY, targetVY, panAccel * dt);
+            camX = clamp(camX + camVX * dt, 0,
+                    Math.max(0, world.getWidth() * cellSize - viewportW));
+            camY = clamp(camY + camVY * dt, 0,
+                    Math.max(0, world.getHeight() * cellSize - viewportH));
+
+            // request a repaint safely on the EDT
+            SwingUtilities.invokeLater(this::repaint);
+        }, 0, 16, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
-    public WorldPanel(World world, JLabel statusLabel) {
-        this.world = world;
-        this.statusLabel = statusLabel;
 
-        setPreferredSize(new Dimension(world.getWidth() * cellSize,
-                world.getHeight() * cellSize));
-        setBackground(Color.WHITE);
-
-        // Mouse: left = select (drag or click), right = move selected (fan-out to nearest free tiles)
-        addMouseListener(new MouseAdapter() {
-            @Override
-            public void mousePressed(MouseEvent e) {
-                int col = e.getX() / cellSize;
-                int row = e.getY() / cellSize;
-                if (!inBounds(row, col)) return;
-
-                if (SwingUtilities.isLeftMouseButton(e)) {
-                    // begin drag-select
-                    dragStartPixel = e.getPoint();
-                    dragEndPixel = e.getPoint();
-                } else if (SwingUtilities.isRightMouseButton(e)) {
-                    moveSelectedToFanOut(row, col);
-                }
-                updateStatus(row, col);
-                repaint();
-            }
-
-            @Override
-            public void mouseReleased(MouseEvent e) {
-                if (SwingUtilities.isLeftMouseButton(e) && dragStartPixel != null) {
-                    // apply selection from rubber-band
-                    applySelectionFromDragWorld(e.isShiftDown() || e.isControlDown());
-                    dragStartPixel = dragEndPixel = null;
-                    repaint();
-                }
-            }
-        });
-
-        // Hover + drag updates
-        addMouseMotionListener(new MouseMotionAdapter() {
-            @Override
-            public void mouseMoved(MouseEvent e) {
-                int mx = e.getX();
-                int my = e.getY();
-
-                // --- EDGE-PANNING LOGIC ---
-                if (mx < edgeBand) {
-                    targetVX = -panMaxSpeed * (1.0 - (double) mx / edgeBand);
-                } else if (mx > viewportW - edgeBand) {
-                    targetVX =  panMaxSpeed * (1.0 - (double) (viewportW - mx) / edgeBand);
-                } else {
-                    targetVX = 0;
-                }
-
-                if (my < edgeBand) {
-                    targetVY = -panMaxSpeed * (1.0 - (double) my / edgeBand);
-                } else if (my > viewportH - edgeBand) {
-                    targetVY =  panMaxSpeed * (1.0 - (double) (viewportH - my) / edgeBand);
-                } else {
-                    targetVY = 0;
-                }
-
-                // --- HOVER CELL STATUS (convert mouse->world coords) ---
-                int col = (int) ((mx + camX) / cellSize);
-                int row = (int) ((my + camY) / cellSize);
-                if (inBounds(row, col)) updateStatus(row, col);
-                else statusLabel.setText("—");
-            }
-
-            @Override
-            public void mouseDragged(MouseEvent e) {
-                if (dragStartPixel != null) {
-                    dragEndPixel = e.getPoint();
-                    repaint();
-                }
-            }
-        });
-
-        // Start timer ~60 FPS
-        Timer timer = new Timer(16, e -> tick());
-        timer.start();
-    }
     // inside WorldPanel.java
     private Color teamFill(characters.Unit u) {
         switch (u.getTeam()) {
@@ -390,36 +401,43 @@ public class WorldPanel extends JPanel {
         if (!enable && buildMode == BuildMode.WALL_PAINT) {
             buildMode = BuildMode.NONE;
             paintPreview.clear();
-            repaint();
         }
         System.out.println("Selected builder? " + enable);
     }
-    private void tick() {
-        long now = System.nanoTime();
-        double dt = (now - lastNanos) / 1_000_000_000.0;
-        if (dt > 0.1) dt = 0.1; // clamp (pause safety)
-        lastNanos = now;
 
-        // --- game updates ---
-        for (Unit u : world.getUnits()) u.update(dt);
-        world.syncUnitsToLayer();
-        world.payIncome(dt);
-        world.processCombat(now / 1_000_000_000.0);
-        world.updateArrows(dt);
+    // --- helper: an arrow is visible if any sampled point along its shaft is in a visible tile
+    private boolean isArrowCurrentlyVisible(world.World world, world.Arrow a) {
+        // sample from tail (hx,hy) to head (px,py)
+        double sx = a.getX(); // world coords (cells) at arrow center
+        double sy = a.getY();
 
-        // --- CAMERA: ease velocity, integrate, clamp ---
-        camVX = approach(camVX, targetVX, panAccel * dt);
-        camVY = approach(camVY, targetVY, panAccel * dt);
+        // direction unit vector (you already compute dx,dy,len below)
+        double dx = (a.tx - a.sx);
+        double dy = (a.ty - a.sy);
+        double len = Math.hypot(dx, dy);
+        if (len < 1e-6) {
+            int r = (int)Math.floor(sy), c = (int)Math.floor(sx);
+            return world.isVisible(r, c);
+        }
+        double ux = dx / len, uy = dy / len;
 
-        camX += camVX * dt;
-        camY += camVY * dt;
+        // pick a modest physical length in cells for how much of the “shaft” we render
+        double body = Math.max(0.5, 0.5); // ~half a tile
 
-        int worldPxW = world.getWidth()  * cellSize;
-        int worldPxH = world.getHeight() * cellSize;
-        camX = clamp(camX, 0, Math.max(0, worldPxW - viewportW));
-        camY = clamp(camY, 0, Math.max(0, worldPxH - viewportH));
+        // head = (sx,sy), tail = head - body * u
+        double hx = sx - ux * body;
+        double hy = sy - uy * body;
 
-        repaint();
+        // sample a few points between tail and head
+        final int SAMPLES = 4;
+        for (int i = 0; i <= SAMPLES; i++) {
+            double t = (double)i / SAMPLES;
+            double x = hx * (1 - t) + sx * t;
+            double y = hy * (1 - t) + sy * t;
+            int r = (int)Math.floor(y), c = (int)Math.floor(x);
+            if (world.isVisible(r, c)) return true;
+        }
+        return false;
     }
     private static double approach(double cur, double tgt, double maxDelta) {
         double d = tgt - cur;
@@ -487,6 +505,10 @@ public class WorldPanel extends JPanel {
                         a.getStrength(), a.getAgility(), a.getIntellect(), a.getVitality()));
                 break;
             }
+            world.Building bb = world.buildingAt(r, c);
+            if (bb != null) {
+                info.append(" | Building: ").append(bb.getType()).append(" (").append(bb.getTeam()).append(")");
+            }
         }
         var rm = world.getResources();
         String totals = String.format(" | RED=%d  BLUE=%d", rm.getWhole(characters.Team.RED), rm.getWhole(characters.Team.BLUE));
@@ -497,10 +519,24 @@ public class WorldPanel extends JPanel {
             info.append(" | Building: HOUSE (" + b.getTeam() + ")");
         }
     }
+    // helper: fraction of 4 sub-samples that are currently visible
+    private double subtileCoverage(world.World w, int r, int c) {
+        // sample the centers of the 4 subcells: (±0.25, ±0.25) around tile center
+        int visCount = 0;
+        // map sub-samples to neighbor tiles
+        int[][] offs = { {-1,-1}, {-1,0}, {0,-1}, {0,0} };
+        for (int i=0;i<4;i++) {
+            int rr = r + offs[i][0];
+            int cc = c + offs[i][1];
+            if (w.inBoundsRC(rr, cc) && w.isVisible(rr, cc)) visCount++;
+        }
+        return visCount / 4.0;
+    }
 
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
+        long p0 = System.nanoTime();
         Graphics2D g2 = (Graphics2D) g.create();
 
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
@@ -523,6 +559,16 @@ public class WorldPanel extends JPanel {
         for (int r = firstRow; r <= lastRow; r++) {
             for (int c = firstCol; c <= lastCol; c++) {
                 int x = c * cellSize, y = r * cellSize;
+
+                boolean vis = world.isVisible(r, c);
+                boolean exp = world.isExplored(r, c);
+
+                // 1) Never-seen: draw solid black and skip everything else
+                if (!exp) {
+                    g2.setColor(Color.BLACK);
+                    g2.fillRect(x, y, cellSize, cellSize);
+                    continue;
+                }
 
                 int ground = world.getCell(r, c, World.LAYER_GROUND);
                 g2.setColor(ground == 0 ? new Color(230,245,230) : new Color(200,200,200));
@@ -566,7 +612,12 @@ public class WorldPanel extends JPanel {
 
         // --- Smooth unit rendering using continuous position ---
         for (characters.Unit u : world.getUnits()) {
+            // hide units in fog
+            if (!isUnitCurrentlyVisible(world, u)) continue;
             if (u.getLength() == 1) {
+                // center in pixels for a 1x1
+                double cxp = (u.getX() + 0.5) * cellSize;
+                double cyp = (u.getY() + 0.5) * cellSize;
                 double px = u.getX() * cellSize;
                 double py = u.getY() * cellSize;
 
@@ -594,6 +645,17 @@ public class WorldPanel extends JPanel {
                     g2.setStroke(new BasicStroke(1.2f));
                     g2.setColor(new Color(30, 30, 30, 180)); // subtle rim
                     g2.drawOval(cx, cy, size, size);
+                }
+                // carried log marker for 1x1 lumber workers (small brown chip)
+                if (u.getRole() == Unit.UnitRole.LUMBER && u.isCarryingLog()) {
+                    int lw = Math.max(4, cellSize / 5);
+                    int lh = Math.max(3, cellSize / 8);
+                    int lx = (int)Math.round(cxp) + cellSize/6 - lw/2;
+                    int ly = (int)Math.round(cyp) - cellSize/6 - lh/2;
+                    g2.setColor(new Color(139,101,67));
+                    g2.fillRoundRect(lx, ly, lw, lh, lh, lh);
+                    g2.setColor(new Color(80,55,30,180));
+                    g2.drawRoundRect(lx, ly, lw, lh, lh, lh);
                 }
 
             } else {
@@ -642,17 +704,18 @@ public class WorldPanel extends JPanel {
                     g2.drawOval((int)Math.round(tx - halfW), (int)Math.round(ty - halfW), cap, cap);
                     g2.drawOval((int)Math.round(hx - halfW), (int)Math.round(hy - halfW), cap, cap);
                 }
+
             }
         }
 
         // --- Draw arrows ---
         for (world.Arrow a : world.getArrows()) {
+            if (!isArrowCurrentlyVisible(world, a)) continue;
             // position in pixels
             double xCells = a.getX(); // col
             double yCells = a.getY(); // row
             double px = xCells * cellSize + cellSize / 2.0;
             double py = yCells * cellSize + cellSize / 2.0;
-
             // direction (from start to target) for orientation
             double dx = (a.tx - a.sx);
             double dy = (a.ty - a.sy);
@@ -681,34 +744,90 @@ public class WorldPanel extends JPanel {
             g2.drawLine((int)Math.round(px), (int)Math.round(py), x1, y1);
             g2.drawLine((int)Math.round(px), (int)Math.round(py), x2, y2);
         }
-        // --- Buildings ---
-        for (world.Building b : world.getBuildings()) {
-            if (b.getType() == Building.Type.HOUSE) {
-                int x = b.getCol() * cellSize;
-                int y = b.getRow() * cellSize;
-                int w = 3 * cellSize;
-                int h = 3 * cellSize;
+        // --- Woods ---
+        for (world.Terrain.TreePatch patch : world.getTreePatches()) {
+            for (world.Terrain.TreeBlock b : patch.trees()) {
+                int x = b.c * cellSize;
+                int y = b.r * cellSize;
+                int w = 2 * cellSize, h = 2 * cellSize;
 
-                // team color fill
-                Color fill = (b.getTeam() == characters.Team.RED) ? new Color(200, 70, 70, 200)
-                        : (b.getTeam() == characters.Team.BLUE) ? new Color(70, 110, 200, 200)
-                        : new Color(120,120,120,200);
-                g2.setColor(fill);
-                g2.fillRect(x, y, w, h);
+                // simple stylized canopy
+                g2.setColor(new Color(44, 102, 56, 215)); // dark green
+                g2.fillRoundRect(x + 1, y + 1, w - 2, h - 2, cellSize, cellSize);
 
-                // roof outline
-                g2.setStroke(new BasicStroke(2f));
-                g2.setColor(new Color(30,30,30,200));
-                g2.drawRect(x, y, w, h);
+                // trunk hints
+                g2.setColor(new Color(80, 55, 30, 200));
+                int trunkW = Math.max(3, cellSize / 5);
+                int trunkH = Math.max(6, cellSize / 2);
+                g2.fillRect(x + w / 2 - trunkW / 2, y + h / 2, trunkW, trunkH);
 
-                // door mark at center
-                g2.setColor(new Color(0,0,0,140));
-                int cx = x + w/2 - cellSize/6;
-                int cy = y + h - cellSize + cellSize/4;
-                g2.fillRect(cx, cy, cellSize/3, cellSize/2);
+                // subtle outline
+                g2.setColor(new Color(20, 20, 20, 150));
+                g2.drawRoundRect(x + 1, y + 1, w - 2, h - 2, cellSize, cellSize);
             }
         }
+        // --- Buildings ---
+        for (world.Building b : world.getBuildings()) {
+            int x = b.getCol() * cellSize;
+            int y = b.getRow() * cellSize;
+            int w = b.getType().w * cellSize;
+            int h = b.getType().h * cellSize;
 
+            // Fill color by team and type
+            java.awt.Color base =
+                    (b.getTeam() == characters.Team.RED)  ? new java.awt.Color(200,70,70,200) :
+                            (b.getTeam() == characters.Team.BLUE) ? new java.awt.Color(70,110,200,200) :
+                                    new java.awt.Color(120,120,120,200);
+
+            // Slight hue per type
+            java.awt.Color fill = switch (b.getType()) {
+                case HOUSE -> base;
+                case FARM  -> new java.awt.Color(base.getRed(), Math.min(255, base.getGreen()+40), base.getBlue(), 180);
+                case BARN  -> new java.awt.Color(Math.min(255, base.getRed()+40), base.getGreen(), base.getBlue(), 200);
+                case LOGGING_CAMP -> new java.awt.Color(139, 101, 67, 190); // brown-ish for logging
+            };
+
+            g2.setColor(fill);
+            g2.fillRect(x, y, w, h);
+
+            g2.setStroke(new BasicStroke(2f));
+            g2.setColor(new java.awt.Color(30,30,30,200));
+            g2.drawRect(x, y, w, h);
+
+            // tiny icon/text
+            g2.setColor(java.awt.Color.BLACK);
+            String label = switch (b.getType()) { case HOUSE -> "H"; case FARM -> "F"; case BARN -> "B"; case LOGGING_CAMP -> "LC";};
+            g2.drawString(label, x + 4, y + 14);
+        }
+        // Fog overlay (world space), after terrain/units/buildings
+        final int FEATHER = 5;            // must match computeFogFeatherDistances(...)
+        final int ALPHA_MAX = 50;        // darkest grey for far unseen
+        final int ALPHA_MIN = 20;         // light veil right next to visible
+
+        for (int r = firstRow; r <= lastRow; r++) {
+            for (int c = firstCol; c <= lastCol; c++) {
+                int x = c * cellSize, y = r * cellSize;
+                boolean vis = world.isVisible(r,c), exp = world.isExplored(r,c);
+
+                if (!exp) { g2.setColor(Color.BLACK); g2.fillRect(x,y,cellSize,cellSize); continue; }
+                // draw ground/buildings here ...
+
+                if (!vis) {
+                    int d = world.getFogDist(r,c);
+                    int clamped = Math.min(FEATHER, (d == Integer.MAX_VALUE ? FEATHER : d));
+                    int baseAlpha = ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * clamped / FEATHER;
+
+                    // soften edge by reducing alpha where nearby sub-samples are visible
+                    double cov = subtileCoverage(world, r, c);   // 0..1 visible around edges
+                    int alpha = (int)Math.round(baseAlpha * (1.0 - 0.55 * cov)); // 55% soften
+                    if (alpha <= 0) continue;
+
+                    g2.setColor(new Color(0,0,0, Math.max(0, Math.min(255, alpha))));
+                    g2.fillRect(x, y, cellSize, cellSize);
+                }
+            }
+        }
+        emaPaintMs = (1-EMA)*emaPaintMs + EMA*((System.nanoTime()-p0)/1_000_000.0);
         // Screen-space overlay layer
         Graphics2D gScreen = (Graphics2D) g.create();
         gScreen.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
@@ -732,8 +851,31 @@ public class WorldPanel extends JPanel {
             gScreen.drawRect(x, y, w, h);
         }
         gScreen.dispose();
+        // draw FPS + timings (no AA)
+        Graphics2D osd = (Graphics2D) g.create();
+        osd.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
+        osd.setColor(Color.BLACK);
+        osd.setFont(getFont().deriveFont(Font.BOLD, 12f));
+        osd.drawString("FPS: " + currentFps + "  tick: " + String.format("%.2fms", emaTickMs)
+                + "  paint: " + String.format("%.2fms", emaPaintMs), 8, 18);
+        osd.dispose();
+    }
+    private boolean isUnitCurrentlyVisible(world.World world, characters.Unit u) {
+        int r = u.getRowRounded(), c = u.getColRounded();
+        if (u.getLength() <= 1) return world.isVisible((int)Math.floor(u.getY()), (int)Math.floor(u.getX()));
 
-        g2.dispose();
+        // Check footprint cells (you already have footprintCells used in isBlocked)
+        for (int[] cell : world.footprintCells(r, c, u.getFacing(), u.getLength())) {
+            int rr = cell[0], cc = cell[1];
+            if (world.isVisible(rr, cc)) return true;
+        }
+        // Fallback: also check head/tail tiles along orient
+        int hr = (int)Math.floor(u.getY());
+        int hc = (int)Math.floor(u.getX());
+        double ux = Math.cos(u.getOrientRad()), uy = Math.sin(u.getOrientRad());
+        int tr = (int)Math.floor(u.getY() - uy); // one tile behind
+        int tc = (int)Math.floor(u.getX() - ux);
+        return world.isVisible(hr, hc) || world.isVisible(tr, tc);
     }
 
     public void setCellSize(int newSize) {
@@ -741,12 +883,10 @@ public class WorldPanel extends JPanel {
         setPreferredSize(new Dimension(world.getWidth() * cellSize,
                 world.getHeight() * cellSize));
         revalidate();
-        repaint();
     }
 
     public void setLayer(int z) {
         currentLayer = z;
-        repaint();
     }
 
     public int getCurrentLayer() {

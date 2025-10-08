@@ -13,7 +13,8 @@ public abstract class Actor {
     private String equipment = "Sword";
     private boolean hasSword = true;       // footmen default to sword
     private boolean hasShortBow = false;   // opt-in
-
+    public double getVisionRangeTiles() { return 15.0; }
+    public double getVisionConeRad()    { return Math.toRadians(100); }
     // Movement speed in cells per second
     private double movement;
     public Actor(ActorType type) {

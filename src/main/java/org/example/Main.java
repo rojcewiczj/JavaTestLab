@@ -18,9 +18,18 @@ public class Main {
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
             World world = new World(100, 160, 2); // bigger map to test camera
-
+            // Generate 5 patches, try 24 blocks each, leave corridor every 4th row/col
+            world.generateWoods(10, 24, 2, 12345L);
             var horse = world.spawnActor(new Horse(), 6, 6);
             horse.setTeam(Team.RED);
+            // spawn a deer using spawnActor (no team set)
+            int r = 12, c = 18;
+            if (!world.isBlocked(r, c, null)) {
+                characters.Unit deer = world.spawnActor(new characters.Deer(), r, c);
+                deer.__engine_setLength(2);                 // so it renders with the capsule shape
+                deer.setAI(new intelligence.DeerAI());      // wandering/fleeing brain
+                // no team call — deer stays neutral / teamless per your setup
+            }
 
             Human archer = Human.basicFootman();
             archer.setName("Archer");
@@ -41,7 +50,7 @@ public class Main {
             world.spawnActor(builder, 4, 5).setTeam(Team.RED);
 
             // Control point
-            world.addControlPoint(new world.ControlPoint(1, 5, 8, 5, 1.5));
+//            world.addControlPoint(new world.ControlPoint(1, 5, 8, 5, 1.5));
 
             // Frame
             JFrame frame = new JFrame("World Grid");

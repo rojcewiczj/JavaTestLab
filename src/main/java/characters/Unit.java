@@ -26,6 +26,24 @@ public class Unit {
 
     // NEW: path as queue of grid waypoints (row,col)
     private final Deque<Point> path = new ArrayDeque<>();
+    // in characters/Unit.java
+    public enum UnitRole { NONE, LUMBER }
+
+    public static enum LumberState {
+        SEEK_TREE, MOVE_TO_TREE, CHOPPING, MOVE_TO_CAMP, IDLE
+    }
+
+    private UnitRole role = UnitRole.NONE;
+    private LumberState lumberState = LumberState.IDLE;
+    private world.Building assignedCamp;   // Logging camp assigned
+    private boolean carryingLog = false;
+
+    // target tree (top-left of 2x2)
+    private int treeTop = -1, treeLeft = -1;
+    // where to stand to chop (adjacent tile)
+    private int standRow = -1, standCol = -1;
+    // chopping timer
+    private double chopTimer = 0.0;
 
     public Unit(Actor actor, int row, int col) {
         this.actor = actor;
@@ -117,6 +135,23 @@ public class Unit {
     private double turnSlowdownStrength = 0.85; // tweak to taste
 
     public void setTurnSlowdownStrength(double k) { turnSlowdownStrength = Math.min(Math.max(0.0, k), 1.0); }
+    // getters/setters
+    public UnitRole getRole() { return role; }
+    public void setRole(UnitRole r) { role = r; }
+    public LumberState getLumberState() { return lumberState; }
+    public void setLumberState(LumberState s) { lumberState = s; }
+    public world.Building getAssignedCamp() { return assignedCamp; }
+    public void setAssignedCamp(world.Building b) { assignedCamp = b; }
+    public boolean isCarryingLog() { return carryingLog; }
+    public void setCarryingLog(boolean v) { carryingLog = v; }
+    public void setTreeTarget(int top, int left) { treeTop = top; treeLeft = left; }
+    public int getTreeTop() { return treeTop; }
+    public int getTreeLeft() { return treeLeft; }
+    public void setStandTile(int r, int c) { standRow = r; standCol = c; }
+    public int getStandRow() { return standRow; }
+    public int getStandCol() { return standCol; }
+    public void setChopTimer(double t) { chopTimer = t; }
+    public double getChopTimer() { return chopTimer; }
 
     // --- NEW: quick helper for combat/ownership logic ---
     public boolean isEnemyOf(Unit other) {
@@ -207,5 +242,16 @@ public class Unit {
             case 6: facing = Facing.N;  break;
             case 7: facing = Facing.NE; break;
         }
+    }
+    // in characters.Unit
+    public interface UnitAI { void update(world.World world, characters.Unit u, double dtSeconds); }
+
+    private UnitAI ai;
+    public void setAI(UnitAI ai) { this.ai = ai; }
+    public UnitAI getAI() { return ai; }
+
+    // call from your game loop (World.update or Panel timer):
+    public void tickAI(world.World world, double dtSeconds) {
+        if (ai != null) ai.update(world, this, dtSeconds);
     }
 }
