@@ -393,11 +393,10 @@ public class WorldPanel extends JPanel {
             double dt = Math.min(0.05, (now - lastNanos) / 1_000_000_000.0);
             lastNanos = now;
 
-            // UPDATE on this background thread
-            // UPDATE on this background thread
+            // 1) AI first (decide aim, pick paths/targets), then movement (turn+step)
             for (Unit u : world.getUnits()) {
-                u.update(dt);      // your usual physics/movement, etc.
-                u.tickAI(world, dt);  // <-- add this line
+                u.tickAI(world, dt);  // <-- NEW: AI decides aim/path/target
+                u.update(dt);         // <-- then rotate/move this frame
             }
             world.syncUnitsToLayer();
             world.payIncome(dt);

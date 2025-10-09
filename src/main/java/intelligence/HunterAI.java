@@ -31,6 +31,31 @@ public class HunterAI implements Unit.UnitAI {
     private double lastDistToTarget = Double.POSITIVE_INFINITY;
     private double repathCooldown = 0.8;
     private double repathTimer = 0.0;
+    // --- Wander (search) controller ---
+    private boolean wandering = false;
+    private int wTarR = Integer.MIN_VALUE, wTarC = Integer.MIN_VALUE;
+    private double wPause = 0.0;
+    private double wRepathCD = 1.5, wRepathT = 0.0;   // was 0.8 → 1.5s
+    private double wRetargetT = 0.0;
+    private double lastWanderDist = Double.POSITIVE_INFINITY;
+
+    // NEW: throttle nudges
+    private double wLastNudgeAtX = 0, wLastNudgeAtY = 0;
+    private int wNudgesThisLeg = 0;
+
+    private static final int    WANDER_MIN_R = 4;
+    private static final int    WANDER_MAX_R = 10;
+    private static final double WANDER_RETARGET_MIN = 2.5;  // was ~1s
+    private static final double WANDER_RETARGET_MAX = 4.0;
+    private static final double WANDER_PAUSE_MIN    = 1.0;  // was ~0.6s
+    private static final double WANDER_PAUSE_MAX    = 2.2;
+    private static final double ARRIVE_EPS          = 0.6;
+
+    // NEW: extra guards for mid-leg nudging
+    private static final double WANDER_MIN_TRAVEL_BETWEEN_NUDGES = 1.75; // tiles
+    private static final int    WANDER_MAX_NUDGES_PER_LEG        = 2;    // at most 2 nudges per leg
+    private static final double WANDER_MIN_HEADING_CHANGE_DEG    = 25.0; // avoid micro-jitters
+
     // --- Aiming / LOS gating ---
     private static final double AIM_DOT_MIN = 0.95;  // ~18° cone
 
@@ -68,13 +93,21 @@ public class HunterAI implements Unit.UnitAI {
         logStateIfChanged(u, world); // prints "STATE → ..." once per transition
 
         // --- Maintain 5s trace: while active, follow ACTUAL deer position ---
+       // put this near the start of HunterAI.update(..), before switch(state)
         if (hasTarget()) {
-            boolean trace = isTraceActive(world, u);
-            Unit deer = getDeerById(world, targetId);
-            if (trace && deer != null) {
-                lastSeenX = deer.getX();
-                lastSeenY = deer.getY();
+            boolean trace = isTraceActive(world, u);  // your 5s rule
+            if (trace) {
+                Unit deer = getDeerById(world, targetId);
+                if (deer != null) {
+                    u.setAimTarget(deer.getX(), deer.getY());   // live deer position
+                } else {
+                    u.setAimTarget(lastSeenX, lastSeenY);       // rare: aim at last known
+                }
+            } else {
+                u.clearAimTarget();                              // trace expired
             }
+        } else {
+            u.clearAimTarget();                                  // no target
         }
 
         switch (u.getHunterState()) {
@@ -107,35 +140,34 @@ public class HunterAI implements Unit.UnitAI {
 
             case SEARCH -> {
                 // If any deer is team-visible RIGHT NOW, lock & pursue
+                // 1) Prefer team-visible deer (locks target and exits SEARCH)
                 Unit vis = pickTargetConsideringCloser(world, u);
                 if (vis != null) {
-                    if (targetId == null || !targetId.equals(vis.getId())) {
-                        setTarget(vis);
-                        log(u, world, "SEARCH: LOCK via VISION deer="+vis.getId()
-                                +" at ("+fmt(vis.getY())+","+fmt(vis.getX())+")");
-                    }
-                    if (!tryApproachForShot(world, u, vis)) {
-                        int rr = (int)Math.round(vis.getY()), cc = (int)Math.round(vis.getX());
-                        setNavTarget(rr, cc);
-                        if (!world.commandMove(u, rr, cc)) {
-                            var p = world.findPath(u, rr, cc);
-                            if (p != null) u.setPath(p);
-                        }
-                        log(u, world, "SEARCH: approach fallback to deer center ("+rr+","+cc+")");
-                    }
+                    setTarget(vis);
+                    u.setAimTarget(vis.getX(), vis.getY());
+                    if (!tryApproachForShot(world, u, vis)) goToLastSeen(world, u);
                     u.setHunterState(MOVE_TO_SHOT);
                     break;
                 }
 
-                // If we already have a target and its trace is still valid (<=5s), keep pursuing it
+                // 2) If we already have a target and trace is valid (<5s unseen), pursue it
                 if (hasTarget() && isTraceActive(world, u)) {
-                    log(u, world, "SEARCH: trace active ("+fmt(traceAgeSec(world,u))+"s), pursuing target "+targetId);
+                    goToLastSeen(world, u);
                     u.setHunterState(MOVE_TO_SHOT);
                     break;
                 }
 
-                // Otherwise, no deer seen by anyone -> actually roam (stay in SEARCH)
-                roamNearCamp(world, u);
+                // 3) Otherwise consult sightings (locks a target id)
+                TeamSightings.Sighting s = pickClosestSighting(world, u);
+                if (s != null) {
+                    setTargetFromSighting(s);
+                    goToLastSeen(world, u);
+                    u.setHunterState(MOVE_TO_SHOT);
+                    break;
+                }
+
+                // 4) Nothing to hunt: meander like a deer (stay in SEARCH)
+                tickSearchWander(world, u, dt);
             }
 
             case MOVE_TO_SHOT -> {
@@ -544,6 +576,142 @@ public class HunterAI implements Unit.UnitAI {
             return best;
         } else {
             return null;
+        }
+    }
+    private double rand(double a, double b){ return a + rng.nextDouble()*(b-a); }
+
+    private boolean arrived(Unit u, int r, int c, double eps){
+        return Math.hypot(r - u.getY(), c - u.getX()) <= eps;
+    }
+
+    /** Pick a reachable point around a base (br,bc) */
+    private java.awt.Point pickNearbyReachableFrom(world.World world, Unit u, int br, int bc, int minR, int maxR){
+        int tries = 16;
+        while (tries-- > 0) {
+            double ang = rand(0, Math.PI*2), r = rand(minR, maxR);
+            int cc = bc + (int)Math.round(Math.cos(ang) * r);
+            int rr = br + (int)Math.round(Math.sin(ang) * r);
+            if (!world.inBoundsRC(rr, cc) || world.isBlocked(rr, cc, u)) continue;
+            var path = world.findPath(u, rr, cc);
+            if (path != null && !path.isEmpty()) return new java.awt.Point(cc, rr);
+        }
+        return null;
+    }
+
+    /** Lightweight jitter retarget near current wander target to create a curve */
+    private java.awt.Point nudgeAround(world.World world, Unit u, int baseR, int baseC, int minR, int maxR){
+        int tries = 10;
+        while (tries-- > 0) {
+            double ang = rand(-Math.PI/3, Math.PI/3);
+            double r = rand(minR, maxR);
+            int rr = baseR + (int)Math.round(Math.sin(ang) * r);
+            int cc = baseC + (int)Math.round(Math.cos(ang) * r);
+            if (!world.inBoundsRC(rr, cc) || world.isBlocked(rr, cc, u)) continue;
+            var path = world.findPath(u, rr, cc);
+            if (path != null && !path.isEmpty()) return new java.awt.Point(cc, rr);
+        }
+        return null;
+    }
+
+    /** Start a new wander leg, biased around camp center if available */
+
+    private void startWander(world.World world, Unit u){
+        int br, bc;
+        var camp = u.getAssignedCamp();
+        if (camp != null) {
+            br = camp.getRow() + camp.getType().h/2;
+            bc = camp.getCol() + camp.getType().w/2;
+        } else {
+            br = (int)Math.floor(u.getY());
+            bc = (int)Math.floor(u.getX());
+        }
+        java.awt.Point p = pickNearbyReachableFrom(world, u, br, bc, WANDER_MIN_R, WANDER_MAX_R);
+        if (p != null) {
+            wTarR = p.y; wTarC = p.x;
+            wandering = true;
+            wRepathT = 0.0;
+            lastWanderDist = Double.POSITIVE_INFINITY;
+
+            // reset nudge throttles
+            wNudgesThisLeg = 0;
+            wLastNudgeAtX = u.getX();
+            wLastNudgeAtY = u.getY();
+            wRetargetT = rand(WANDER_RETARGET_MIN, WANDER_RETARGET_MAX);
+
+            if (!world.commandMove(u, wTarR, wTarC)) {
+                var path = world.findPath(u, wTarR, wTarC);
+                if (path != null) u.setPath(path);
+            }
+            if (DEBUG) System.out.println("[HUNTER id="+u.getId()+"] WANDER start -> ("+wTarR+","+wTarC+")");
+        } else {
+            wPause = rand(0.6, 1.0);
+            wandering = false;
+            if (DEBUG) System.out.println("[HUNTER id="+u.getId()+"] WANDER no target; pausing "+String.format("%.2f",wPause));
+        }
+    }
+    /** Tick meander: short pauses, occasional retargets, and watchdog repaths */
+    private static double deg(double rad){ return rad * 180.0 / Math.PI; }
+
+    private void tickSearchWander(world.World world, Unit u, double dt){
+        u.clearAimTarget();
+
+        if (wPause > 0.0) { wPause -= dt; return; }
+        if (!wandering || wTarR == Integer.MIN_VALUE) { startWander(world, u); return; }
+
+        double d = Math.hypot(wTarR - u.getY(), wTarC - u.getX());
+        wRepathT -= dt;
+        wRetargetT -= dt;
+
+        boolean noProgress = (d > lastWanderDist - 0.05);
+        if (wRepathT <= 0.0 && (!u.isMoving() || noProgress)) {
+            if (!world.commandMove(u, wTarR, wTarC)) {
+                var p = world.findPath(u, wTarR, wTarC);
+                if (p != null) u.setPath(p);
+            }
+            wRepathT = wRepathCD;
+            lastWanderDist = d;
+        }
+
+        // Only consider a nudge if we've traveled a bit since last nudge and we’re not retargeting too fast
+        double traveledSinceNudge = Math.hypot(u.getY() - wLastNudgeAtY, u.getX() - wLastNudgeAtX);
+        if (wRetargetT <= 0.0
+                && d > 3.0
+                && u.isMoving()
+                && traveledSinceNudge >= WANDER_MIN_TRAVEL_BETWEEN_NUDGES
+                && wNudgesThisLeg < WANDER_MAX_NUDGES_PER_LEG) {
+
+            var n = nudgeAround(world, u, wTarR, wTarC, 2, 4);
+            if (n != null) {
+                // avoid micro-turns: require a decent heading change vs current target
+                double curAng = Math.atan2(wTarR - u.getY(), wTarC - u.getX());
+                double newAng = Math.atan2(n.y - u.getY(), n.x - u.getX());
+                double headingDelta = Math.abs(Math.atan2(Math.sin(newAng - curAng), Math.cos(newAng - curAng)));
+
+                if (deg(headingDelta) >= WANDER_MIN_HEADING_CHANGE_DEG) {
+                    wTarR = n.y; wTarC = n.x;
+                    if (!world.commandMove(u, wTarR, wTarC)) {
+                        var p = world.findPath(u, wTarR, wTarC);
+                        if (p != null) u.setPath(p);
+                    }
+                    wRetargetT = rand(WANDER_RETARGET_MIN, WANDER_RETARGET_MAX);
+                    wLastNudgeAtX = u.getX(); wLastNudgeAtY = u.getY();
+                    wNudgesThisLeg++;
+                    if (DEBUG) System.out.println("[HUNTER id="+u.getId()+"] WANDER nudge -> ("+wTarR+","+wTarC+")");
+                } else {
+                    // too tiny: defer a bit, don’t spam
+                    wRetargetT = 1.2;
+                }
+            } else {
+                // couldn’t find a good nudge—try again later
+                wRetargetT = 1.2;
+            }
+        }
+
+        if (arrived(u, wTarR, wTarC, ARRIVE_EPS)) {
+            wandering = false;
+            wTarR = wTarC = Integer.MIN_VALUE;
+            wPause = rand(WANDER_PAUSE_MIN, WANDER_PAUSE_MAX);
+            if (DEBUG) System.out.println("[HUNTER id="+u.getId()+"] WANDER arrived; pausing "+String.format("%.2f",wPause));
         }
     }
 

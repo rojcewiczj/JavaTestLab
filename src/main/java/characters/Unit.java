@@ -17,6 +17,7 @@ public class Unit {
     private boolean selected;
     // Ranged attack cooldown (absolute time in seconds)
     private double nextRangedAttackAt = 0.0;
+
     public int length = 1;         // 1 = normal; 2 = horse or mounted
     public Unit rider = null;      // when this unit is a horse carrying a rider
     public boolean mounted = false; // true when the horse is carrying a rider
@@ -90,7 +91,14 @@ public class Unit {
     public void addHide(int n) { hideCount += Math.max(0, n); }
     public void clearHuntLoot() { meatCount = 0; hideCount = 0; }
     public void setMounted(boolean v) { mounted = v; }
+    // Unit.java (fields)
+    private boolean aimOverride = false;
+    private double aimX = 0.0, aimY = 0.0;
 
+    // Unit.java (API)
+    public void setAimTarget(double tx, double ty) { aimOverride = true;  aimX = tx; aimY = ty; }
+    public void clearAimTarget()                  { aimOverride = false; }
+    public boolean hasAimTarget()                 { return aimOverride; }
     public void setRider(Unit r) { rider = r; }
     public int getId() { return id; }
     public void __engine_setId(int id) { this.id = id; } // only World should call
@@ -175,62 +183,70 @@ public class Unit {
         return this.team != other.team;
     }
 
-    /** Advance along the path by speed * dt (cells/sec). */
+    /** Advance along the path by speed * dt (cells/sec), but always turn toward aim target if set. */
     public void update(double dt) {
-        if (!moving) return;
-        if (path.isEmpty()) {
-            moving = false;
+        // ------------- peek movement waypoint (if any) -------------
+        boolean havePath = moving && !path.isEmpty();
+        Point waypoint = null;
+        double wx = 0, wy = 0, dx = 0, dy = 0, dist = 0;
+
+        if (havePath) {
+            waypoint = path.peekFirst();
+            wx = waypoint.x;  // col
+            wy = waypoint.y;  // row
+            dx = wx - x;
+            dy = wy - y;
+            dist = Math.hypot(dx, dy);
+            if (dist < 1e-6) { dx = dy = 0; }
+        }
+
+        // ------------- choose the orientation target -------------
+        // If AI set an aim target (e.g., deer), look at that; otherwise look where we move.
+        double desired = orientRad;
+        boolean haveMoveDir = havePath && dist > 1e-6;
+        if (aimOverride)           desired = Math.atan2(aimY - y, aimX - x);
+        else if (haveMoveDir)      desired = Math.atan2(dy, dx);
+        // else keep current orientRad
+
+        // ------------- smooth turn toward desired -------------
+        double diff = Math.atan2(Math.sin(desired - orientRad), Math.cos(desired - orientRad));
+        double maxStep = turnRateRad * dt;
+        if (Math.abs(diff) <= maxStep) orientRad = desired;
+        else                           orientRad += Math.copySign(maxStep, diff);
+
+        if (orientRad <= -Math.PI) orientRad += 2 * Math.PI;
+        if (orientRad >   Math.PI) orientRad -= 2 * Math.PI;
+
+        // ------------- if no path, we're just turning in place -------------
+        if (!havePath) {
+            // discrete 8-way facing from smooth orientation
+            double ang = orientRad < 0 ? orientRad + 2 * Math.PI : orientRad;
+            int sector = (int) Math.round(ang / (Math.PI / 4.0)) & 7; // 0..7
+            switch (sector) {
+                case 0 -> facing = Facing.E;
+                case 1 -> facing = Facing.SE;
+                case 2 -> facing = Facing.S;
+                case 3 -> facing = Facing.SW;
+                case 4 -> facing = Facing.W;
+                case 5 -> facing = Facing.NW;
+                case 6 -> facing = Facing.N;
+                case 7 -> facing = Facing.NE;
+            }
             return;
         }
 
-        Point waypoint = path.peekFirst();
-        double wx = waypoint.x, wy = waypoint.y;
-        double dx = wx - x, dy = wy - y;
-        double dist = Math.hypot(dx, dy);
-        // Smoothly rotate toward desired direction while moving
-        double step;
-        if (dist > 1e-6) {
-            double desired = Math.atan2(dy, dx);           // [-pi,pi]
-            double diff = desired - orientRad;
-            // wrap to [-pi, pi]
-            diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        // ------------- movement speed with strafing slowdown -------------
+        // Slow down only a bit when aiming somewhere different than our move direction.
+        double align = Math.max(0.0, Math.cos(Math.atan2(dy, dx) - orientRad)); // 1 aligned, 0 sideways
+        double k = aimOverride ? 0.35 : 0.85;   // much less slowdown while aiming at a target
+        double minFrac = 0.25;                  // allow decent strafing speed
+        double speedFrac = Math.max(minFrac, (1 - k) + k * align);
+        if (getLength() >= 2) speedFrac *= 0.95 + 0.05 * align;
 
-            double maxStep = turnRateRad * dt;
-            if (Math.abs(diff) <= maxStep) orientRad = desired;
-            else orientRad += Math.copySign(maxStep, diff);
+        double step = actor.getMovement() * speedFrac * dt;
 
-            if (orientRad <= -Math.PI) orientRad += 2 * Math.PI;
-            if (orientRad >   Math.PI) orientRad -= 2 * Math.PI;
-
-            // --- Slow down while turning ---
-            double align = Math.max(0.0, Math.cos(diff));        // 1 aligned, 0 sideways
-            double k = 0.85;                                     // turning slowdown strength
-            double minFrac = 0.20;                               // <- optional min speed (20%)
-            double speedFrac = Math.max(minFrac, (1 - k) + k * align);
-
-            if (getLength() >= 2) {                              // small extra penalty for long body
-                speedFrac *= 0.95 + 0.05 * align;
-            }
-
-            step = actor.getMovement() * speedFrac * dt;
-        } else {
-            step = actor.getMovement() * dt;
-        }
-
-// arrived at this waypoint?
-        if (dist < 1e-3) {
-            x = wx; y = wy;
-            path.removeFirst();
-            if (path.isEmpty()) {
-                moving = false;
-                lastMoveNanos = System.nanoTime();
-                return;
-            }
-            waypoint = path.peekFirst();
-        }
-
-// advance toward waypoint using slowed 'step'
-        if (step >= dist) {
+        // ------------- waypoint arrival / advancement -------------
+        if (dist < 1e-3 || step >= dist) {
             x = wx; y = wy;
             path.removeFirst();
             if (path.isEmpty()) {
@@ -242,20 +258,18 @@ public class Unit {
             y += (dy / dist) * step;
         }
 
-/* CHANGE THIS PART: derive discrete 8-way facing from SMOOTH orientation,
-   not from atan2(dy,dx), so footprint/rendering match the smooth turn. */
-        double ang = orientRad;
-        if (ang < 0) ang += 2 * Math.PI;
+        // ------------- discrete 8-way facing from smooth orientation -------------
+        double ang = orientRad < 0 ? orientRad + 2 * Math.PI : orientRad;
         int sector = (int) Math.round(ang / (Math.PI / 4.0)) & 7; // 0..7
         switch (sector) {
-            case 0: facing = Facing.E;  break;
-            case 1: facing = Facing.SE; break;
-            case 2: facing = Facing.S;  break;
-            case 3: facing = Facing.SW; break;
-            case 4: facing = Facing.W;  break;
-            case 5: facing = Facing.NW; break;
-            case 6: facing = Facing.N;  break;
-            case 7: facing = Facing.NE; break;
+            case 0 -> facing = Facing.E;
+            case 1 -> facing = Facing.SE;
+            case 2 -> facing = Facing.S;
+            case 3 -> facing = Facing.SW;
+            case 4 -> facing = Facing.W;
+            case 5 -> facing = Facing.NW;
+            case 6 -> facing = Facing.N;
+            case 7 -> facing = Facing.NE;
         }
     }
     // in characters.Unit
