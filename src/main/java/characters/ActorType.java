@@ -6,5 +6,6 @@ public enum ActorType {
     ELF,
     HORSE,
     DEER,
+    WOLF,
     // add more as needed
 }

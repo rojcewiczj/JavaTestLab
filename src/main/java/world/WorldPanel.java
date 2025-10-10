@@ -399,13 +399,15 @@ public class WorldPanel extends JPanel {
                 u.update(dt);         // <-- then rotate/move this frame
             }
             world.syncUnitsToLayer();
+            world.updateWolfPackSightings();
             world.payIncome(dt);
-            world.processCombat(now / 1e9);
+//            world.processCombat(now / 1e9);
             world.updateArrows(dt);
             world.trySpawnArrivalsForHouses();
             world.updateLumberJobs(dt);
             world.cleanupDead();
             world.computeVisibility();
+
             // camera integration
             camVX = approach(camVX, targetVX, panAccel * dt);
             camVY = approach(camVY, targetVY, panAccel * dt);
@@ -423,7 +425,8 @@ public class WorldPanel extends JPanel {
     private Color teamFill(characters.Unit u) {
         switch (u.getTeam()) {
             case RED:  return new Color(220, 70, 70);    // warm red
-            case BLUE: return new Color(70, 120, 220);   // cool blue
+            case BLUE: return new Color(70, 120, 220);
+            case WOLF: return new Color(90,90,90,220);// cool blue
             default:   return new Color(80, 80, 80);     // neutral/gray
         }
     }
@@ -826,6 +829,7 @@ public class WorldPanel extends JPanel {
                 case BARN  -> new Color(Math.min(255, base.getRed()+40), base.getGreen(), base.getBlue(), 200);
                 case LOGGING_CAMP -> new Color(139, 101, 67, 190); // brown-ish for logging
                 case HUNTING_CAMP -> new Color(168, 142, 92, 190);
+                case WOLF_DEN -> new Color(90, 90, 90, 200); // dark grey
             };
 
             g2.setColor(fill);
@@ -842,7 +846,8 @@ public class WorldPanel extends JPanel {
                 case FARM          -> "F";
                 case BARN          -> "B";
                 case LOGGING_CAMP  -> "LC";
-                case HUNTING_CAMP  -> "HC";   // <-- add this
+                case HUNTING_CAMP  -> "HC";
+                case WOLF_DEN -> "WD";// <-- add this
             };
             g2.drawString(label, x + 4, y + 14);
         }

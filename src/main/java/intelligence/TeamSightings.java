@@ -51,6 +51,7 @@ public class TeamSightings {
 
         for (Unit u : world.getUnits()) {
             if (!(u.getActor() instanceof characters.Deer)) continue;
+            if (u.isDead()) continue;
             int rr = (int)Math.floor(u.getY());
             int cc = (int)Math.floor(u.getX());
             if (world.isVisible(rr, cc)) {

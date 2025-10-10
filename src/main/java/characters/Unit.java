@@ -51,7 +51,7 @@ public class Unit {
     // NEW: path as queue of grid waypoints (row,col)
     private final Deque<Point> path = new ArrayDeque<>();
     // in characters/Unit.java
-    public enum UnitRole { NONE, LUMBER, HUNTER }
+    public enum UnitRole { NONE, LUMBER, HUNTER, WOLF }
 
     public static enum LumberState {
         SEEK_TREE, MOVE_TO_TREE, CHOPPING, MOVE_TO_CAMP, IDLE
@@ -62,6 +62,9 @@ public class Unit {
     private HunterState hunterState = HunterState.IDLE;
     private boolean hasBow = false;
     private double rangedCooldownSec = 1.0;
+    private int meleeSkill = 0;             // 0..10 => 0..100%
+    private double meleeCooldownSec = 1.0;  // seconds
+    private double nextMeleeAt = 0.0;
     private UnitRole role = UnitRole.NONE;
     private LumberState lumberState = LumberState.IDLE;
     private world.Building assignedCamp;   // Logging camp assigned
@@ -87,6 +90,8 @@ public class Unit {
         this.aimSkill  = clamp01(actor.defaultAimSkill());
         this.power     = clamp01(actor.defaultPower());
         this.rangedCooldownSec = clampCooldown(actor.defaultRangedCooldown());
+        this.setMeleeSkill(actor.defaultMeleeSkill());
+        this.setMeleeCooldownSec(actor.defaultMeleeCooldown());
         // team stays NEUTRAL unless set later
     }
 
@@ -127,6 +132,14 @@ public class Unit {
     private double aimX = 0.0, aimY = 0.0;
     public void setAimSkill(int v){ aimSkill = Math.max(0, Math.min(10, v)); }
     public int  getAimSkill(){ return aimSkill; }
+    public int getMeleeSkill() { return meleeSkill; }
+    public void setMeleeSkill(int s) { meleeSkill = Math.max(0, Math.min(10, s)); }
+
+    public double getMeleeCooldownSec() { return meleeCooldownSec; }
+    public void setMeleeCooldownSec(double s) { meleeCooldownSec = Math.max(0.2, s); }
+
+    public double getNextMeleeAt() { return nextMeleeAt; }
+    public void setNextMeleeAt(double t) { nextMeleeAt = t; }
 
     public void setPower(int v){ power = Math.max(0, Math.min(10, v)); }
     public int  getPower(){ return power; }

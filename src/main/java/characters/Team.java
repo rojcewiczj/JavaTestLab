@@ -1,5 +1,5 @@
 package characters;
 
 public enum Team {
-        RED, BLUE, NEUTRAL
+        RED, BLUE, NEUTRAL, WOLF
 }

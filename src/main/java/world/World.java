@@ -1,9 +1,6 @@
 package world;
 
-import characters.Actor;
-import characters.Human;
-import characters.Team;
-import characters.Unit;
+import characters.*;
 import intelligence.TeamSightings;
 
 import java.awt.*;
@@ -46,12 +43,17 @@ public class World {
     // quick helper: check if a tile is inside any 2×2 tree
     // World.java: fields
     private boolean[][] treeMask;  // [height][width]
+    private int nextBuildingId = 1;
+
+    private void assignBuildingId(Building b) { b.__engine_setId(nextBuildingId++); }
     // world/World.java
     private characters.Team playerVisionTeam = characters.Team.RED;
 
     public characters.Team getPlayerVisionTeam() { return playerVisionTeam; }
     private final TeamSightings teamSightings = new TeamSightings();
-
+    // world/World.java
+    private final intelligence.PackSightings packSightings = new intelligence.PackSightings(/* ttlNanos= */5_000_000_000L);
+    public intelligence.PackSightings getPackSightings() { return packSightings; }
     public java.util.Map<Integer, TeamSightings.Sighting> getSightingsForTeam(characters.Team t) {
         return teamSightings.view(t);
     }
@@ -160,7 +162,107 @@ public class World {
         return new int[]{ bestR, bestC };
     }
 
+    public boolean addWolfDen(int top, int left) {
+        Building b = new Building(Building.Type.WOLF_DEN, top, left, characters.Team.NEUTRAL);
+        if (!canPlaceBuilding(Building.Type.WOLF_DEN ,top, left)) return false;
+        buildings.add(b);
+        assignBuildingId(b);
+        stampBuilding(top, left, b.getType().h, b.getType().w, true);
+        return true;
+    }
+    /** Place 1 den and 3 wolves around it. Returns the den building. */
+    public Building generateWolfDenAndPack(int top, int left) {
+        if (!addWolfDen(top, left)) return null;
+        Building den = buildingAt(top, left);
+        if (den == null) return null;
 
+        // spawn 3 wolves near the den perimeter
+        int[][] offs = {{-1,-1},{-1, den.getType().w},{den.getType().h, -1}};
+        for (int i=0;i<3;i++){
+            int rr = top + den.getType().h/2 + offs[i][0];
+            int cc = left+ den.getType().w/2 + offs[i][1];
+            // find nearest free
+            for (int rad=0; rad<4; rad++){
+                boolean placed=false;
+                for (int dr=-rad; dr<=rad && !placed; dr++){
+                    for (int dc=-rad; dc<=rad && !placed; dc++){
+                        int r = rr+dr, c = cc+dc;
+                        if (!inBoundsRC(r,c) || isBlocked(r,c,null)) continue;
+                        var u = spawnActor(new characters.Wolf(ActorType.WOLF), r, c);
+                        u.setTeam(characters.Team.WOLF);
+                        u.__engine_setLength(2);
+                        u.setAssignedCamp(den);                // reuse assignedCamp as “den”
+                        // If Actor lacks defaults, set here:
+                        u.setAimSkill(0);
+                        u.setMeleeSkill(4);
+                        u.setPower(3);
+                        u.setMaxWounds(2);
+                        u.setMeleeCooldownSec(0.8);
+                        // wire AI
+                        u.setAI(new intelligence.WolfAI(den.getId()));
+                        placed = true;
+                    }
+                }
+                if (placed) break;
+            }
+        }
+        return den;
+    }
+    // world/World.java
+    public void updateWolfPackSightings() {
+        long now = System.nanoTime();
+
+        for (characters.Unit spotter : units) {
+            // only wolves report for their pack
+            if (!(spotter.getActor() instanceof characters.Wolf)) continue;
+
+            // wolves belong to a pack via their assigned den (we used it as "home")
+            world.Building den = spotter.getAssignedCamp();
+            if (den == null) continue;
+            int packId = den.getId();
+
+            // scan possible targets: humans (RED/BLUE) & deer
+            for (characters.Unit target : units) {
+                if (target == spotter) continue;
+                if (target.isDead()) continue;
+
+                boolean isDeer = target.getActor() instanceof characters.Deer;
+                boolean isHuman = (target.getTeam() == characters.Team.RED || target.getTeam() == characters.Team.BLUE);
+                if (!isDeer && !isHuman) continue;
+
+                if (unitCanSee(spotter, target)) {
+                    packSightings.packReportSighting(packId, target, now);
+                }
+            }
+        }
+
+        // optional: prune global (also prunes per-den)
+        packSightings.pruneAll(now);
+    }
+    // world/World.java
+    private boolean unitCanSee(characters.Unit spotter, characters.Unit target) {
+        // range
+        double range = spotter.getActor().getVisionRangeTiles();
+        double dx = target.getX() - spotter.getX();
+        double dy = target.getY() - spotter.getY();
+        double d2 = dx*dx + dy*dy;
+        if (d2 > range*range) return false;
+
+        // cone (optional—use actor cone)
+        double coneRad = spotter.getActor().getVisionConeRad(); // 2π = omni
+        if (coneRad < Math.PI * 1.999 && d2 > 1e-9) {
+            double len = Math.sqrt(d2);
+            double fx = Math.cos(spotter.getOrientRad());
+            double fy = Math.sin(spotter.getOrientRad());
+            double dot = (dx/len)*fx + (dy/len)*fy;
+            if (dot < Math.cos(coneRad * 0.5)) return false;
+        }
+
+        // line of sight using your existing terrain blockers
+        int sr = (int)Math.floor(spotter.getY()), sc = (int)Math.floor(spotter.getX());
+        int tr = (int)Math.floor(target.getY()),  tc = (int)Math.floor(target.getX());
+        return hasLineOfSight(sr, sc, tr, tc); // you already use this in ranged combat
+    }
     /** Call once per tick before painting. */
     public void computeVisibility() {
         // clear current visibility
@@ -434,7 +536,9 @@ public class World {
     // add a house, then spawn arrivals
     public boolean addHouse(int topRow, int leftCol, characters.Team team) {
         if (!canPlaceBuilding(Building.Type.HOUSE, topRow, leftCol)) return false;
+        Building b = new Building(Building.Type.HOUSE, topRow, leftCol, team);
         buildings.add(new Building(Building.Type.HOUSE, topRow, leftCol, team));
+        assignBuildingId(b);
         stampBuilding(topRow, leftCol, Building.Type.HOUSE.h, Building.Type.HOUSE.w, true);
 //        rebuildOpaqueMask();
         return true; // spawning handled in trySpawnArrivalsForHouses()
@@ -442,21 +546,27 @@ public class World {
 
     public boolean addFarm(int topRow, int leftCol, characters.Team team) {
         if (!canPlaceBuilding(Building.Type.FARM, topRow, leftCol)) return false;
-        buildings.add(new Building(Building.Type.FARM, topRow, leftCol, team));
+        Building b = new Building(Building.Type.FARM, topRow, leftCol, team);
+        buildings.add(b);
+        assignBuildingId(b);
         stampBuilding(topRow, leftCol, Building.Type.FARM.h, Building.Type.FARM.w, true);
         return true;
     }
 
     public boolean addBarn(int topRow, int leftCol, characters.Team team) {
         if (!canPlaceBuilding(Building.Type.BARN, topRow, leftCol)) return false;
-        buildings.add(new Building(Building.Type.BARN, topRow, leftCol, team));
+        Building b = new Building(Building.Type.BARN, topRow, leftCol, team);
+        buildings.add(b);
+        assignBuildingId(b);
         stampBuilding(topRow, leftCol, Building.Type.BARN.h, Building.Type.BARN.w, true);
 //        rebuildOpaqueMask();
         return true;
     }
     public boolean addLoggingCamp(int topRow, int leftCol, characters.Team team) {
         if (!canPlaceLoggingCamp(topRow, leftCol)) return false;
-        buildings.add(new Building(Building.Type.LOGGING_CAMP, topRow, leftCol, team));
+        Building b = new Building(Building.Type.LOGGING_CAMP, topRow, leftCol, team);
+        buildings.add(b);
+        assignBuildingId(b);
         // stamp to building mask for collision:
         stampBuilding(topRow, leftCol, Building.Type.LOGGING_CAMP.h, Building.Type.LOGGING_CAMP.w, true);
 //        rebuildOpaqueMask();
@@ -1086,7 +1196,25 @@ public class World {
     private String meleeWeaponName(characters.Unit u) {
         return u.getActor().hasSword() ? "Sword" : "Fists";
     }
+    public void resolveMeleeHit(characters.Unit attacker, characters.Unit target){
+        if (attacker == null || target == null) return;
+        if (target.isDead()) return;
 
+        double hitP = Math.max(0, Math.min(10, attacker.getMeleeSkill())) * 0.10;
+        if (rng.nextDouble() > hitP) {
+            System.out.println("MELEE: miss " + attacker.getActor().getName() + " -> " + target.getActor().getName());
+            return;
+        }
+
+        double dmgP = Math.max(0, Math.min(10, attacker.getPower())) * 0.10;
+        if (rng.nextDouble() > dmgP) {
+            System.out.println("MELEE: hit no-dmg " + attacker.getActor().getName() + " -> " + target.getActor().getName());
+            return;
+        }
+
+        System.out.println("MELEE: HIT+DMG " + attacker.getActor().getName() + " -> " + target.getActor().getName());
+        target.applyWound(this);
+    }
     public void processCombat(double nowSeconds) {
         // ----- Ranged phase -----
         for (characters.Unit archer : units) {
