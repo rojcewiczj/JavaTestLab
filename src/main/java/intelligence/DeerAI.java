@@ -197,5 +197,6 @@ public class DeerAI implements Unit.UnitAI {
         return pickNearbyReachable(world, u, 4, 8);
     }
 
+
     private double rand(double a, double b) { return a + rng.nextDouble()*(b-a); }
 }

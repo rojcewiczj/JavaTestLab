@@ -28,6 +28,7 @@ public class Main {
                 characters.Unit deer = world.spawnActor(new characters.Deer(), r, c);
                 deer.__engine_setLength(2);                 // so it renders with the capsule shape
                 deer.setAI(new intelligence.DeerAI());      // wandering/fleeing brain
+                deer.setTeam(Team.NEUTRAL);
                 // no team call — deer stays neutral / teamless per your setup
             }
 

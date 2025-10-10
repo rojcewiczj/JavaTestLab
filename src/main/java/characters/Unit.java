@@ -8,7 +8,18 @@ import java.util.Deque;
 
 public class Unit {
     private final Actor actor;
+    // --- Combat stats ---
+    public enum LifeState { ALIVE, WOUNDED, DEAD }
+    private LifeState life = LifeState.ALIVE;
 
+    private int maxWounds = 2;
+    private int wounds    = 2;
+
+    private int aimSkill  = 0;  // 0..10 -> 0..100% hit chance
+    private int power     = 0;  // 0..10 -> 0..100% damage chance
+
+    private double movementScale = 1.0; // 1.0 normal; <1 when wounded
+    private double timeOfDeathSec = -1.0; // world.nowSeconds() when DEAD
     private double x;         // col (continuous)
     private double y;         // row (continuous)
     private int targetCol;
@@ -21,7 +32,19 @@ public class Unit {
     public int length = 1;         // 1 = normal; 2 = horse or mounted
     public Unit rider = null;      // when this unit is a horse carrying a rider
     public boolean mounted = false; // true when the horse is carrying a rider
+    // --- Health / wounds ---
+    private boolean dead = false;
+    private long deathNanos = 0L;
 
+    // --- Corpse / loot ---
+    private boolean lootable = false;   // corpse can be looted
+    private boolean looted   = false;   // already looted once
+    private int lootMeat = 0, lootHide = 0;
+
+    // --- Carry (optional, simple booleans for now) ---
+    private boolean carryingMeat = false, carryingHide = false;
+    public boolean isCarryingMeat(){ return carryingMeat; }
+    public boolean isCarryingHide(){ return carryingHide; }
     // --- NEW: team ---
     private Team team = Team.NEUTRAL;
 
@@ -38,6 +61,7 @@ public class Unit {
     // fields (put near other role-specific fields)
     private HunterState hunterState = HunterState.IDLE;
     private boolean hasBow = false;
+    private double rangedCooldownSec = 1.0;
     private UnitRole role = UnitRole.NONE;
     private LumberState lumberState = LumberState.IDLE;
     private world.Building assignedCamp;   // Logging camp assigned
@@ -57,6 +81,12 @@ public class Unit {
         this.targetCol = col;
         this.targetRow = row;
         this.moving = false;
+        // inside Unit(...) constructors, after existing init:
+        this.maxWounds = Math.max(1, actor.defaultMaxWounds());
+        this.wounds    = this.maxWounds;
+        this.aimSkill  = clamp01(actor.defaultAimSkill());
+        this.power     = clamp01(actor.defaultPower());
+        this.rangedCooldownSec = clampCooldown(actor.defaultRangedCooldown());
         // team stays NEUTRAL unless set later
     }
 
@@ -65,7 +95,8 @@ public class Unit {
         this(actor, row, col);
         this.team = (team == null ? Team.NEUTRAL : team);
     }
-
+    public double getRangedCooldownSec() { return rangedCooldownSec; }
+    public void setRangedCooldownSec(double s) { rangedCooldownSec = Math.max(0.1, s); }
     public Actor getActor() { return actor; }
 
     /** Replace current path with a new one (in grid coords row/col). */
@@ -94,7 +125,52 @@ public class Unit {
     // Unit.java (fields)
     private boolean aimOverride = false;
     private double aimX = 0.0, aimY = 0.0;
+    public void setAimSkill(int v){ aimSkill = Math.max(0, Math.min(10, v)); }
+    public int  getAimSkill(){ return aimSkill; }
 
+    public void setPower(int v){ power = Math.max(0, Math.min(10, v)); }
+    public int  getPower(){ return power; }
+
+    public int  getMaxWounds(){ return maxWounds; }
+    public void setMaxWounds(int mw){ maxWounds = Math.max(1, mw); wounds = Math.min(wounds, maxWounds); }
+    public int  getWounds(){ return wounds; }
+
+    public LifeState getLife(){ return life; }
+    public boolean isDead(){ return life == LifeState.DEAD; }
+    public boolean isWounded(){ return life == LifeState.WOUNDED; }
+    public double  getDeathTimeSec(){ return timeOfDeathSec; }
+
+    /** Apply one wound. Moves -> WOUNDED (slow) or DEAD (stops, leaves corpse). */
+    public void applyWound(world.World world){
+        if (isDead()) return;
+        wounds -= 1;
+        if (wounds <= 0) {
+            life = LifeState.DEAD;
+            movementScale = 0.0;
+            moving = false;
+            path.clear();
+            timeOfDeathSec = world.nowSeconds();
+            clearAimTarget();
+            ai = null;            // no more AI
+            selected = false;     // optional
+        } else {
+            life = LifeState.WOUNDED;
+            movementScale = 0.5;  // slower when wounded
+        }
+    }
+    public long getDeathNanos(){ return deathNanos; }
+
+    public boolean isLootable(){ return dead && lootable && !looted; }
+
+    public boolean lootCorpse(Unit looter){
+        if (!isLootable()) return false;
+        if (lootMeat <= 0 && lootHide <= 0) return false;
+        // take 1/1 as requested
+        if (lootMeat > 0) { looter.carryingMeat = true; lootMeat = 0; }
+        if (lootHide > 0) { looter.carryingHide = true; lootHide = 0; }
+        looted = true;
+        return true;
+    }
     // Unit.java (API)
     public void setAimTarget(double tx, double ty) { aimOverride = true;  aimX = tx; aimY = ty; }
     public void clearAimTarget()                  { aimOverride = false; }
@@ -243,7 +319,12 @@ public class Unit {
         double speedFrac = Math.max(minFrac, (1 - k) + k * align);
         if (getLength() >= 2) speedFrac *= 0.95 + 0.05 * align;
 
-        double step = actor.getMovement() * speedFrac * dt;
+        // CHANGED: apply wounded/debuff scaling to base movement
+        double baseSpeed = actor.getMovement() * movementScale;
+
+        // CHANGED: use no-turn fallback when we essentially have no move direction
+        double step = haveMoveDir ? (baseSpeed * speedFrac * dt)
+                : (baseSpeed * dt);
 
         // ------------- waypoint arrival / advancement -------------
         if (dist < 1e-3 || step >= dist) {
@@ -274,7 +355,8 @@ public class Unit {
     }
     // in characters.Unit
     public interface UnitAI { void update(world.World world, characters.Unit u, double dtSeconds); }
-
+    private static int clamp01(int v){ return Math.max(0, Math.min(10, v)); }
+    private static double clampCooldown(double s){ return Math.max(0.1, s); }
     private UnitAI ai;
     public void setAI(UnitAI ai) { this.ai = ai; }
     public UnitAI getAI() { return ai; }

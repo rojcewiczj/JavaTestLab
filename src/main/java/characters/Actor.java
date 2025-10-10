@@ -15,6 +15,11 @@ public abstract class Actor {
     private boolean hasShortBow = false;   // opt-in
     public double getVisionRangeTiles() { return 15.0; }
     public double getVisionConeRad()    { return Math.toRadians(100); }
+    // characters/Actor.java
+    public int    defaultAimSkill()       { return 0; }   // 0..10 -> 0..100%
+    public int    defaultPower()          { return 0; }   // 0..10 -> 0..100%
+    public int    defaultMaxWounds()      { return 2; }   // humans & deer = 2
+    public double defaultRangedCooldown() { return 1.0; } // seconds between shots
     // Movement speed in cells per second
     private double movement;
     public Actor(ActorType type) {

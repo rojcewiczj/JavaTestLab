@@ -7,7 +7,11 @@ public class Human extends Actor {
                  double movement) {
         super(ActorType.HUMAN, name, strength, agility, intellect, vitality, movement);
     }
-
+    // characters/Footman.java  (or whatever your basic human is)
+    @Override public int defaultAimSkill()       { return 3; }
+    @Override public int defaultPower()          { return 3; }
+    @Override public int defaultMaxWounds()      { return 2; }
+    @Override public double defaultRangedCooldown(){ return 1.0; }
     // Convenience default Human
     public static Human basicFootman() {
         return new Human("Footman", 3, 3, 2, 3, 3.0); // movement = 3 cells/sec

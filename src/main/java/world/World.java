@@ -709,6 +709,16 @@ public class World {
 
         return true;
     }
+    public void fireArrowShot(characters.Unit shooter, characters.Unit target) {
+        // spawn from the shooter’s center toward the *current* target pos
+        arrows.add(new Arrow(
+                shooter.getX(), shooter.getY(),
+                target.getX(),   target.getY(),
+                12.0, // speed in tiles/sec (tweak)
+                shooter.getId(),
+                target.getId()
+        ));
+    }
 
     /** Called before issuing a manual player move (or any time you want to cancel job loops). */
     public void interruptForManualControl(characters.Unit u) {
@@ -848,39 +858,63 @@ public class World {
 
     public java.util.List<Arrow> getArrows() { return arrows; }
 
-    // Spawn an arrow (use continuous positions)
-    public void spawnArrow(double sx, double sy, double tx, double ty, double speedCellsPerSec) {
-        arrows.add(new Arrow(sx, sy, tx, ty, speedCellsPerSec));
-    }
+
     // 4) Time & arrow visual (stubs if you don’t have them yet)
     public double nowSeconds() { return System.nanoTime() / 1e9; }
 
     // Tunable default arrow speed (tiles per second)
     private static final double ARROW_SPEED_CPS = 14.0;
 
-    /** Fire an arrow with the default speed. */
-    public void fireArrowVisual(characters.Unit shooter, double tx, double ty) {
-        fireArrowVisual(shooter, tx, ty, ARROW_SPEED_CPS);
-    }
-
-    /** Fire an arrow with an explicit speed (tiles/sec). */
-    public void fireArrowVisual(characters.Unit shooter, double tx, double ty, double speedCellsPerSec) {
-        // Start slightly ahead of the shooter so the arrow doesn't overlap the unit
-        double nudge = 0.35; // tiles
-        double sx = shooter.getX() + Math.cos(shooter.getOrientRad()) * nudge;
-        double sy = shooter.getY() + Math.sin(shooter.getOrientRad()) * nudge;
-
-        // If target is essentially the same spot, don't spawn
-        if (Math.hypot(tx - sx, ty - sy) < 1e-4) return;
-
-        arrows.add(new Arrow(sx, sy, tx, ty, speedCellsPerSec));
-    }
     // Advance & prune arrows each tick
     public void updateArrows(double dt) {
         java.util.Iterator<Arrow> it = arrows.iterator();
         while (it.hasNext()) {
             Arrow a = it.next();
-            if (a.update(dt)) it.remove();
+            boolean arrived = a.step(dt);
+            if (arrived) {
+                resolveRangedHit(a);
+                it.remove();
+            }
+        }
+    }
+    public void cleanupDead(){
+        double now = nowSeconds();
+        units.removeIf(u -> u.isDead() && (now - u.getDeathTimeSec()) >= 30.0);
+    }
+    private final java.util.Random rng = new java.util.Random();
+
+    private characters.Unit unitById(int id){
+        for (characters.Unit u : units) if (u.getId() == id) return u;
+        return null;
+    }
+
+    private void resolveRangedHit(Arrow a){
+        if (a.targetId == null) return; // purely visual arrow
+        var shooter = unitById(a.shooterId);
+        var target  = unitById(a.targetId);
+        if (shooter == null || target == null || target.isDead()) return;
+
+        double hitP = Math.max(0, Math.min(10, shooter.getAimSkill())) * 0.10;  // 0..1
+        double dmgP = Math.max(0, Math.min(10, shooter.getPower()))    * 0.10;
+
+        boolean hit = rng.nextDouble() < hitP;
+        if (!hit) {
+            System.out.println("[COMBAT] " + shooter.getActor().getName() + " MISSED " + target.getActor().getName());
+            return;
+        }
+
+        boolean dmg = rng.nextDouble() < dmgP;
+        if (!dmg) {
+            System.out.println("[COMBAT] " + shooter.getActor().getName() + " grazed " + target.getActor().getName());
+            return;
+        }
+
+        target.applyWound(this);
+        if (target.isDead()) {
+            System.out.println("[COMBAT] " + shooter.getActor().getName() + " KILLED " + target.getActor().getName());
+        } else if (target.isWounded()) {
+            System.out.println("[COMBAT] " + shooter.getActor().getName() + " WOUNDED " + target.getActor().getName()
+                    + " (wounds left: " + target.getWounds() + ")");
         }
     }
 
@@ -1056,8 +1090,14 @@ public class World {
     public void processCombat(double nowSeconds) {
         // ----- Ranged phase -----
         for (characters.Unit archer : units) {
+            // CHANGED: skip dead
+            if (archer.isDead()) continue;
+
             var a = archer.getActor();
             if (!a.hasShortBow()) continue;
+
+            // CHANGED: let Hunter AI handle its own shots to avoid double-firing
+            if (archer.getRole() == characters.Unit.UnitRole.HUNTER) continue;
 
             int ar = archer.getRowRounded(), ac = archer.getColRounded();
 
@@ -1065,7 +1105,8 @@ public class World {
             boolean engaged = false;
             for (characters.Unit other : units) {
                 if (other == archer) continue;
-                if (other.getTeam() == archer.getTeam()) continue;
+                if (other.isDead()) continue; // CHANGED
+                if (!archer.isEnemyOf(other)) continue; // CHANGED: proper enemy check
                 if (adjacent(ar, ac, other.getRowRounded(), other.getColRounded())) { engaged = true; break; }
             }
             if (engaged) continue;
@@ -1074,44 +1115,50 @@ public class World {
             characters.Unit best = null;
             int bestDist = Integer.MAX_VALUE;
             for (characters.Unit enemy : units) {
-                if (enemy.getTeam() == archer.getTeam()) continue;
+                if (enemy == archer) continue;
+                if (enemy.isDead()) continue;               // CHANGED
+                if (!archer.isEnemyOf(enemy)) continue;     // CHANGED (avoids shooting NEUTRAL deer, etc.)
+
                 int er = enemy.getRowRounded(), ec = enemy.getColRounded();
-                int d = chebyshev(ar, ac, er, ec);
+                int d  = chebyshev(ar, ac, er, ec);
                 if (d < 3 || d > 10) continue;
                 if (!hasLineOfSight(ar, ac, er, ec)) continue;
+
                 if (d < bestDist) { best = enemy; bestDist = d; }
             }
             if (best == null) continue;
 
             // fire if cooldown is up
             if (nowSeconds >= archer.getNextRangedAttackAt()) {
+                // Optional: face the target while shooting
+                archer.setAimTarget(best.getX(), best.getY()); // will keep facing during/after move
+
                 System.out.println(archer.getActor().getName() + " (" + archer.getTeam()
                         + ", Short Bow) shoots at "
                         + best.getActor().getName() + " (" + best.getTeam() + ")");
 
-                // spawn a flying arrow (use 'this.' if inside World)
-                spawnArrow(
-                        archer.getX(), archer.getY(),
-                        best.getX(),   best.getY(),
-                        12.0 // tiles/sec
-                );
+                // CHANGED: use the new resolver-carrying shot
+                fireArrowShot(archer, best);
 
-                archer.setNextRangedAttackAt(nowSeconds + attackInterval(archer));
+                // CHANGED: use per-unit cooldown (or keep your attackInterval if you prefer)
+                double cd = (archer.getRangedCooldownSec() > 0) ? archer.getRangedCooldownSec() : 1.0;
+                archer.setNextRangedAttackAt(nowSeconds + cd);
             }
         }
 
-        // ----- Melee phase (your existing engagement system) -----
-        // ... your existing contact-pair build, charger init, and hit printing ...
-        // Make sure your melee print uses meleeWeaponName(u) to show Sword/Fists.
-        // (Paste your earlier melee Engagement code here unchanged, except weapon string:)
-        Set<Long> seenThisFrame = new HashSet<>();
+        // ----- Melee phase (unchanged logic, but skip dead units) -----
+        java.util.Set<Long> seenThisFrame = new java.util.HashSet<>();
 
         for (int i = 0; i < units.size(); i++) {
             Unit ui = units.get(i);
+            if (ui.isDead()) continue; // CHANGED
             int ri = ui.getRowRounded(), ci = ui.getColRounded();
+
             for (int j = i + 1; j < units.size(); j++) {
                 Unit uj = units.get(j);
-                if (ui.getTeam() == uj.getTeam()) continue;          // must be enemies
+                if (uj.isDead()) continue; // CHANGED
+
+                if (ui.getTeam() == uj.getTeam()) continue;          // enemies only (you can switch to isEnemyOf if desired)
                 if (!isFootman(ui) || !isFootman(uj)) continue;      // only footmen for now
 
                 int rj = uj.getRowRounded(), cj = uj.getColRounded();
@@ -1122,34 +1169,30 @@ public class World {
 
                 Engagement eg = engagements.computeIfAbsent(key, k -> new Engagement(ui.getId(), uj.getId()));
                 if (!eg.initialized) {
-                    // initiative to the charger: the one who moved most recently
                     long li = ui.getLastMoveNanos();
                     long lj = uj.getLastMoveNanos();
                     boolean iCharges = li > lj;
 
                     if (iCharges) {
-                        eg.nextAttackA = nowSeconds;                         // ui first
-                        eg.nextAttackB = nowSeconds + attackInterval(uj);    // uj after its interval
+                        eg.nextAttackA = nowSeconds;                       // ui first
+                        eg.nextAttackB = nowSeconds + attackInterval(uj);  // uj after its interval
                     } else {
                         eg.nextAttackA = nowSeconds + attackInterval(ui);
-                        eg.nextAttackB = nowSeconds;                         // uj first
+                        eg.nextAttackB = nowSeconds;                       // uj first
                     }
                     eg.initialized = true;
                 }
 
-                // 2) drive attacks
-                // Map eg.a to the actual unit reference
+                // drive attacks (still printing for now)
                 Unit a = (eg.aId == ui.getId()) ? ui : uj;
                 Unit b = (eg.bId == ui.getId()) ? ui : uj;
 
-                // a’s turn?
                 if (nowSeconds >= eg.nextAttackA) {
                     System.out.println(a.getActor().getName() + " (" + a.getTeam() + ", " + a.getActor().getEquipment()
                             + ") hits " + b.getActor().getName() + " (" + b.getTeam() + ")");
                     eg.nextAttackA += attackInterval(a);
                 }
 
-                // b’s turn?
                 if (nowSeconds >= eg.nextAttackB) {
                     System.out.println(b.getActor().getName() + " (" + b.getTeam() + ", " + b.getActor().getEquipment()
                             + ") hits " + a.getActor().getName() + " (" + a.getTeam() + ")");
@@ -1158,7 +1201,6 @@ public class World {
             }
         }
 
-        // 3) clean up engagements that are no longer in contact
         engagements.keySet().removeIf(k -> !seenThisFrame.contains(k));
     }
     private static final class Node {

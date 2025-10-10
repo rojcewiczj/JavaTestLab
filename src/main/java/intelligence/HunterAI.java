@@ -42,7 +42,8 @@ public class HunterAI implements Unit.UnitAI {
     // NEW: throttle nudges
     private double wLastNudgeAtX = 0, wLastNudgeAtY = 0;
     private int wNudgesThisLeg = 0;
-
+    // seconds between shots
+    private static final double shootCooldown = 1.0;
     private static final int    WANDER_MIN_R = 4;
     private static final int    WANDER_MAX_R = 10;
     private static final double WANDER_RETARGET_MIN = 2.5;  // was ~1s
@@ -196,6 +197,13 @@ public class HunterAI implements Unit.UnitAI {
                     u.setHunterState(SEARCH);
                     break;
                 }
+                if (deer.isDead()) {
+                    clearNavTarget();
+                    u.clearAimTarget();
+                    u.setHunterState(LOOT);
+                    break;
+                }
+
 
                 double d = Math.hypot(deer.getY() - u.getY(), deer.getX() - u.getX());
                 if (d <= BOW_RANGE - 0.5) {
@@ -320,7 +328,13 @@ public class HunterAI implements Unit.UnitAI {
 
                 Unit deer = getDeerById(world, targetId);
                 if (deer == null) { log(u, world, "SHOOT: deer missing; SEARCH"); clearTarget(); u.setHunterState(SEARCH); break; }
-
+                if (deer.isDead()) {
+                    // stop firing; go loot
+                    clearNavTarget();
+                    u.clearAimTarget();
+                    u.setHunterState(LOOT);
+                    break;
+                }
                 double d = Math.hypot(deer.getY()-u.getY(), deer.getX()-u.getX());
 
                 // If deer ran out of range or LOS is blocked, immediately go pursue again
@@ -341,13 +355,44 @@ public class HunterAI implements Unit.UnitAI {
 
                 double now = world.nowSeconds();
                 if (now >= nextShotAt) {
-                    world.fireArrowVisual(u, deer.getX(), deer.getY());
-                    nextShotAt = now + SHOOT_COOLDOWN;
+                    world.fireArrowShot(u, deer);     // <-- carries shooter/target for resolution
+                    nextShotAt = now + u.getRangedCooldownSec();
                     log(u, world, "SHOOT: fired at deer "+deer.getId()+" d="+fmt(d));
+                }
+
+            }
+            case LOOT -> {
+                if (!hasTarget()) { u.setHunterState(SEARCH); break; }
+                Unit deer = getDeerById(world, targetId);
+                if (deer == null) { clearTarget(); u.setHunterState(SEARCH); break; }
+
+                // If somehow not dead yet, go back to pursuing/shooting
+                if (!deer.isDead()) { u.setHunterState(MOVE_TO_SHOT); break; }
+
+                int tr = (int)Math.round(deer.getY());
+                int tc = (int)Math.round(deer.getX());
+
+                // Move to corpse
+                if (!u.isMoving() && dist(u.getY(),u.getX(), tr,tc) > 1.1) {
+                    if (!world.commandMove(u, tr, tc)) {
+                        var p = world.findPath(u, tr, tc);
+                        if (p != null) u.setPath(p);
+                    }
+                    break;
+                }
+
+                double d = dist(u.getY(),u.getX(), tr,tc);
+                if (d <= 1.1) {
+                    boolean ok = deer.lootCorpse(u);
+                    System.out.println("[HUNTER id="+u.getId()+"] LOOT "+(ok?"OK":"FAIL")+" deer="+deer.getId());
+                    clearTarget();
+                    u.clearAimTarget();
+                    // For now, go back to SEARCH. Later you can RETURN_TO_CAMP to unload.
+                    u.setHunterState(SEARCH);
                 }
             }
 
-            case LOOT, RETURN_TO_CAMP, UNLOAD, IDLE -> { /* later */ }
+            case RETURN_TO_CAMP, UNLOAD, IDLE -> { /* later */ }
         }
     }
 
@@ -357,6 +402,13 @@ public class HunterAI implements Unit.UnitAI {
     private static void log(Unit u, world.World w, String msg){
         System.out.println("[HUNTER id="+u.getId()+" t="+fmt(w.nowSeconds())+"] "+msg);
     }
+    private static double dist(double r1, double c1, double r2, double c2) {
+        return Math.hypot(r2 - r1, c2 - c1);
+    }
+    private static double dist2(double r1, double c1, double r2, double c2) {
+        double dr = r2 - r1, dc = c2 - c1;
+        return dr*dr + dc*dc; // no sqrt version if you just compare distances
+    }
     private Unit.HunterState lastLoggedState = null;
     private void logStateIfChanged(Unit u, world.World w){
         var s = u.getHunterState();
@@ -364,6 +416,9 @@ public class HunterAI implements Unit.UnitAI {
             lastLoggedState = s;
             log(u, w, "STATE → " + s);
         }
+    }
+    private boolean isAliveDeer(Unit u){
+        return (u != null) && (u.getActor() instanceof characters.Deer) && !u.isDead();
     }
     private double traceAgeSec(world.World world, Unit u){
         var book = world.getSightingsForTeam(u.getTeam());
@@ -555,7 +610,9 @@ public class HunterAI implements Unit.UnitAI {
     // ---- SEARCH helpers ----
 
     private Unit pickTargetConsideringCloser(world.World world, Unit hunter) {
+
         Unit cur = getDeerById(world, targetId);
+        if (cur != null && cur.isDead()) cur = null;
         boolean curVisible = cur != null && isTeamVisible(world, cur);
 
         Unit best = null; double bestD2 = Double.POSITIVE_INFINITY;

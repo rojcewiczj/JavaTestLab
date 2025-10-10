@@ -404,6 +404,7 @@ public class WorldPanel extends JPanel {
             world.updateArrows(dt);
             world.trySpawnArrivalsForHouses();
             world.updateLumberJobs(dt);
+            world.cleanupDead();
             world.computeVisibility();
             // camera integration
             camVX = approach(camVX, targetVX, panAccel * dt);
