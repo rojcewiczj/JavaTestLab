@@ -154,22 +154,49 @@ public class Unit {
     public double  getDeathTimeSec(){ return timeOfDeathSec; }
 
     /** Apply one wound. Moves -> WOUNDED (slow) or DEAD (stops, leaves corpse). */
-    public void applyWound(world.World world){
+    public void applyWound(world.World world) {
+        // Fast guard
         if (isDead()) return;
-        wounds -= 1;
-        if (wounds <= 0) {
-            life = LifeState.DEAD;
-            movementScale = 0.0;
-            moving = false;
-            path.clear();
-            timeOfDeathSec = world.nowSeconds();
-            clearAimTarget();
-            ai = null;            // no more AI
-            selected = false;     // optional
-        } else {
-            life = LifeState.WOUNDED;
-            movementScale = 0.5;  // slower when wounded
+
+        // Decrement first; branch predictability improves vs double checks
+        if (--wounds > 0) {
+            // Non-lethal: very cheap
+            if (life != LifeState.WOUNDED) life = LifeState.WOUNDED;
+            // Avoid oscillating this if you already cap speed elsewhere; otherwise keep it:
+            movementScale = 0.5;
+            return;
         }
+
+        // ---- Lethal hit: do the absolute minimum here ----
+        life = LifeState.DEAD;
+
+        // Stop motion cheaply
+        moving = false;
+        movementScale = 0.0;
+
+        // Kill steering/aim (cheap fields only)
+        clearAimTarget();
+
+        // Stop following the current path without heavy churn:
+        // If path can be large, clearing allocates/frees per node; prefer a fast clear.
+        // (If Unit exposes a fast-path like setPath(null) or setPathLen(0), use that.)
+        if (path != null && !path.isEmpty()) {
+            path.clear();            // keep if this list is small; otherwise replace with a fast flag in Unit
+            // e.g., if you can: this.pathLen = 0; // O(1) logical clear
+        }
+
+        // Timestamp (if this is expensive, let caller pass a cached "now")
+        timeOfDeathSec = world.nowSeconds();
+
+        // IMPORTANT: Do NOT null out AI here. The AI update already early-outs on isDead().
+        // Nulling here causes GC churn and can fight with other code reading ai this frame.
+        // ai = null;
+
+        // Optional UI thing is often non-trivial; defer it if your UI listens synchronously.
+        // selected = false;
+
+        // If you have a post-tick cleanup queue, enqueue and return (best perf).
+        // world.queueUnitDeath(this); // <-- uncomment if you implement the small helper below.
     }
     public long getDeathNanos(){ return deathNanos; }
 

@@ -28,7 +28,23 @@ public class World {
 
     // Opaque mask cache (updated when trees/buildings change)
     private final boolean[][] opaque;
+    // --- Melee logging controls ---
+    private static final boolean LOG_MELEE = false;   // set true if you want sampled logs
+    private static final double  LOG_MELEE_SAMPLE_P = 0.02; // 2% of events when logging is on
 
+    // --- (Optional) performance safety budget ---
+// Limit melee resolves per short time window to avoid spikes during feeding frenzies.
+// Set MELEE_MAX_PER_WINDOW = Integer.MAX_VALUE to effectively disable the budget.
+    private static final int    MELEE_MAX_PER_WINDOW = 64;   // resolves per window
+    private static final double MELEE_WINDOW_SEC     = 0.02; // 20ms window (~50 windows/sec)
+
+    private double meleeWindowEndsAtSec = 0.0;
+    private int    meleeResolvesInWindow = 0;
+
+    // Simple helper to sample logs without building strings unless needed
+    private boolean meleeShouldLogSampled() {
+        return LOG_MELEE && rng.nextDouble() < LOG_MELEE_SAMPLE_P;
+    }
     // NEW: units in the world
     private final List<Unit> units = new ArrayList<>();
     private final List<ControlPoint> controlPoints = new ArrayList<>();
@@ -60,11 +76,57 @@ public class World {
     public void setPlayerVisionTeam(characters.Team t) {
         playerVisionTeam = (t == null ? characters.Team.RED : t);
     }
+    // === Dynamic per-tile unit occupancy (O(1) lookup) ===
+// Stamp trick avoids clearing whole arrays every frame.
+    private int curUnitStamp = 1;
+    private int[][] unitStamp;      // when cell was last written (== curUnitStamp => valid this frame)
+    private short[][] unitCount;    // how many units occupy the cell this frame
+    private int[][] unitSingleId;   // the sole unit id if count==1, else -1
+
 
     // call when world is constructed (or whenever size known)
     private void initMasks() {
-        treeMask = new boolean[height][width];
+        treeMask     = new boolean[height][width];
         buildingMask = new boolean[height][width];
+        unitStamp    = new int[height][width];
+        unitCount    = new short[height][width];
+        unitSingleId = new int[height][width];
+        // IMPORTANT: default to -1 so “single id” logic works even if an id could be 0
+        for (int r = 0; r < height; r++) java.util.Arrays.fill(unitSingleId[r], -1);
+    }
+    /** Rebuild the unit occupancy mask for the current frame. O(#units * footprint). */
+    public void rebuildUnitMask() {
+        curUnitStamp++;
+        if (curUnitStamp == Integer.MAX_VALUE) {
+            // rare wrap: hard reset
+            for (int r = 0; r < height; r++) {
+                java.util.Arrays.fill(unitStamp[r], 0);
+                java.util.Arrays.fill(unitCount[r], (short)0);
+                java.util.Arrays.fill(unitSingleId[r], -1);
+            }
+            curUnitStamp = 1;
+        }
+
+        for (characters.Unit u : units) {
+            if (u == null || u.isDead()) continue;
+            int ar = u.getRowRounded();
+            int ac = u.getColRounded();
+            java.util.List<int[]> cells = footprintCells(ar, ac, u.getFacing(), u.getLength());
+            for (int[] cell : cells) {
+                int r = cell[0], c = cell[1];
+                if (!inBoundsRC(r, c)) continue;
+
+                if (unitStamp[r][c] != curUnitStamp) {
+                    unitStamp[r][c]    = curUnitStamp;
+                    unitCount[r][c]    = 1;
+                    unitSingleId[r][c] = u.getId();
+                } else {
+                    int cnt = unitCount[r][c] + 1;
+                    unitCount[r][c] = (short)cnt;
+                    if (cnt > 1) unitSingleId[r][c] = -1; // mark “multiple”
+                }
+            }
+        }
     }
 
     // whenever you add/remove trees:
@@ -124,6 +186,14 @@ public class World {
         return opaque[r][c];
     }
 
+    /** O(1) occupancy check using the mask. Ignores 'ignore' if it's the only occupant. */
+    public boolean isOccupiedFast(int r, int c, characters.Unit ignore) {
+        if (unitStamp[r][c] != curUnitStamp) return false; // nobody wrote here this frame
+        int cnt = unitCount[r][c];
+        if (cnt == 0) return false;
+        if (cnt == 1 && ignore != null && unitSingleId[r][c] == ignore.getId()) return false;
+        return true;
+    }
     // --- Fog arrays accessors for renderer ---
     public boolean isVisible(int r, int c)  { return inBoundsRC(r,c) && visible[r][c]; }
     public boolean isExplored(int r, int c) { return inBoundsRC(r,c) && explored[r][c]; }
@@ -1196,23 +1266,58 @@ public class World {
     private String meleeWeaponName(characters.Unit u) {
         return u.getActor().hasSword() ? "Sword" : "Fists";
     }
-    public void resolveMeleeHit(characters.Unit attacker, characters.Unit target){
+    public void resolveMeleeHit(characters.Unit attacker, characters.Unit target) {
+        // --- fast guards ---
         if (attacker == null || target == null) return;
         if (target.isDead()) return;
 
-        double hitP = Math.max(0, Math.min(10, attacker.getMeleeSkill())) * 0.10;
+        // --- OPTIONAL: lightweight per-window budget to protect frame time ---
+        // Uses world.nowSeconds() if you have it; otherwise use System.nanoTime()*1e-9.
+        double nowSec = nowSeconds(); // replace with (System.nanoTime()*1e-9) if needed
+        if (nowSec >= meleeWindowEndsAtSec) {
+            meleeWindowEndsAtSec = nowSec + MELEE_WINDOW_SEC;
+            meleeResolvesInWindow = 0;
+        }
+        if (meleeResolvesInWindow >= MELEE_MAX_PER_WINDOW) {
+            // Soft drop: treat as a miss (cheap) to maintain play flow without stalling the frame.
+            if (meleeShouldLogSampled()) {
+                var a = attacker.getActor().getName();
+                var t = target.getActor().getName();
+                System.out.println("MELEE: (budget) miss " + a + " -> " + t);
+            }
+            return;
+        }
+        meleeResolvesInWindow++;
+
+        // --- hit roll ---
+        // Clamp to [0,10] once; multiply to get probability in [0,1].
+        double hitP = Math.min(10.0, Math.max(0.0, attacker.getMeleeSkill())) * 0.10;
         if (rng.nextDouble() > hitP) {
-            System.out.println("MELEE: miss " + attacker.getActor().getName() + " -> " + target.getActor().getName());
+            if (meleeShouldLogSampled()) {
+                var a = attacker.getActor().getName();
+                var t = target.getActor().getName();
+                System.out.println("MELEE: miss " + a + " -> " + t);
+            }
             return;
         }
 
-        double dmgP = Math.max(0, Math.min(10, attacker.getPower())) * 0.10;
+        // --- damage roll ---
+        double dmgP = Math.min(10.0, Math.max(0.0, attacker.getPower())) * 0.10;
         if (rng.nextDouble() > dmgP) {
-            System.out.println("MELEE: hit no-dmg " + attacker.getActor().getName() + " -> " + target.getActor().getName());
+            if (meleeShouldLogSampled()) {
+                var a = attacker.getActor().getName();
+                var t = target.getActor().getName();
+                System.out.println("MELEE: hit no-dmg " + a + " -> " + t);
+            }
             return;
         }
 
-        System.out.println("MELEE: HIT+DMG " + attacker.getActor().getName() + " -> " + target.getActor().getName());
+        // --- apply damage ---
+        if (meleeShouldLogSampled()) {
+            var a = attacker.getActor().getName();
+            var t = target.getActor().getName();
+            System.out.println("MELEE: HIT+DMG " + a + " -> " + t);
+        }
         target.applyWound(this);
     }
     public void processCombat(double nowSeconds) {
@@ -1394,68 +1499,142 @@ public class World {
     public boolean isBlocked(int r, int c, characters.Unit ignore) {
         if (!inBoundsRC(r, c) || !isWalkable(r, c)) return true;
 
-        // O(1) terrain & static blockers first
+        // O(1) static blockers
         if (treeMask[r][c])     return true;
         if (buildingMask[r][c]) return true;
 
-        // Optional: if you maintain a unitMask each tick,
-        // you can do this and return early unless the ignore unit occupies (r,c):
-        // if (unitMask[r][c]) {
-        //     // If the only occupant is 'ignore', allow it; otherwise blocked.
-        //     // For simplicity, fall through to the precise check below.
-        // }
+        // O(1) dynamic blockers (mask)
+        if (isOccupiedFast(r, c, ignore)) return true;
 
-        // Precise check against unit footprints (expensive, keep last)
-        for (characters.Unit other : units) {
-            if (other == ignore) continue;
-            int hr = other.getRowRounded(), hc = other.getColRounded();
-            for (int[] cell : footprintCells(hr, hc, other.getFacing(), other.getLength())) {
-                if (cell[0] == r && cell[1] == c) return true;
-            }
+        // Optional fallback: if you're worried about rare desync within the tick,
+        // keep (or remove) the precise loop. With rebuildUnitMask() each frame,
+        // you can safely remove it for speed.
+    /*
+    for (characters.Unit other : units) {
+        if (other == ignore || other.isDead()) continue;
+        int hr = other.getRowRounded(), hc = other.getColRounded();
+        for (int[] cell : footprintCells(hr, hc, other.getFacing(), other.getLength())) {
+            if (cell[0] == r && cell[1] == c) return true;
         }
+    }
+    */
         return false;
     }
     // World.java
     public boolean isBlockedContinuous(double x, double y, characters.Unit moving) {
-        // Convert the unit’s continuous anchor to grid coords
         int anchorR = (int)Math.floor(y);
         int anchorC = (int)Math.floor(x);
-
-        // Get the unit’s footprint cells at that anchor
         int[][] cells = footprintCells(anchorR, anchorC, moving.getFacing(), moving.getLength()).toArray(new int[0][]);
-
-        // Check each covered cell using your existing method, ignoring the mover
         for (int[] cell : cells) {
             int r = cell[0], c = cell[1];
-            if (isBlocked(r, c, moving)) return true;
+            if (isBlocked(r, c, moving)) return true; // now O(1) via mask
         }
         return false;
     }
+
     // World.java
     public boolean commandMove(Unit u, int destRow, int destCol) {
-        // If the goal tile is hard-blocked for this unit, try nearby tiles (small ring search)
-        java.util.List<Point> path = null;
-        if (!isBlocked(destRow, destCol, u)) {
-            path = findPath(u, destRow, destCol);
+        // 0) Early exits & fast paths
+        final int sr = u.getRowRounded();
+        final int sc = u.getColRounded();
+        if (sr == destRow && sc == destCol) {
+            // Already there; clear or keep current path — return success
+            u.setPath(java.util.Collections.emptyList());
+            return true;
         }
-        if (path == null || path.isEmpty()) {
-            // try a few nearby candidates
-            final int MAX_RADIUS = 4;
-            outer:
-            for (int r = 1; r <= MAX_RADIUS; r++) {
-                for (int dc = -r; dc <= r; dc++) {
-                    for (int dr = -r; dr <= r; dr++) {
-                        int rr = destRow + dr, cc = destCol + dc;
-                        if (!inBoundsRC(rr, cc) || isBlocked(rr, cc, u)) continue;
-                        path = findPath(u, rr, cc);
-                        if (path != null && !path.isEmpty()) break outer;
-                    }
-                }
+
+        // One-tile neighbor fast path (includes diagonals with corner-cut guard)
+        int dRow = Integer.compare(destRow, sr);
+        int dCol = Integer.compare(destCol, sc);
+        if (Math.max(Math.abs(destRow - sr), Math.abs(destCol - sc)) == 1) {
+            if (!isBlocked(destRow, destCol, u) && noDiagonalCornerCut(sr, sc, destRow, destCol, u)) {
+                java.util.ArrayList<Point> oneStep = new java.util.ArrayList<>(1);
+                oneStep.add(new Point(destCol, destRow));
+                u.setPath(oneStep);
+                return true;
             }
         }
-        if (path == null || path.isEmpty()) return false;
-        u.setPath(path);
+
+        // 1) Try exact goal if it’s not *statically* blocked
+        if (!isStaticallyBlocked(destRow, destCol)) {
+            var pathDirect = findPath(u, destRow, destCol);
+            if (pathDirect != null && !pathDirect.isEmpty()) {
+                u.setPath(pathDirect);
+                return true;
+            }
+        }
+
+        // 2) Try a small, ordered set of nearby alternatives (Chebyshev rings)
+        final int MAX_RADIUS = 3;          // smaller search area than before
+        final int MAX_ASTAR_TRIES = 10;    // hard cap on heavy calls
+        int astarTries = 0;
+
+        java.util.ArrayList<int[]> alts = collectAltGoalsChebyshev(destRow, destCol, MAX_RADIUS);
+        // Score: prefer easy from current pos + still close to intended dest
+        alts.sort((a, b) -> {
+            int aFromUnit = Math.max(Math.abs(a[0] - sr), Math.abs(a[1] - sc)); // Chebyshev from unit
+            int bFromUnit = Math.max(Math.abs(b[0] - sr), Math.abs(b[1] - sc));
+            int aToDest   = Math.max(Math.abs(a[0] - destRow), Math.abs(a[1] - destCol));
+            int bToDest   = Math.max(Math.abs(b[0] - destRow), Math.abs(b[1] - destCol));
+            // weight reaching ease a bit higher than “close to dest”
+            int aScore = aFromUnit * 3 + aToDest;
+            int bScore = bFromUnit * 3 + bToDest;
+            return Integer.compare(aScore, bScore);
+        });
+
+        for (int[] g : alts) {
+            if (astarTries >= MAX_ASTAR_TRIES) break;
+
+            int gr = g[0], gc = g[1];
+            if (isStaticallyBlocked(gr, gc)) continue;          // never try terrain-blocked
+            if (isBlocked(gr, gc, u)) continue;                 // skip if *currently* hard blocked
+
+            var p = findPath(u, gr, gc);
+            astarTries++;
+            if (p != null && !p.isEmpty()) {
+                u.setPath(p);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /* ===== Helpers (put in the same World class) ===== */
+
+    // Static terrain/building only — OK to path “toward” a temporarily occupied cell
+    private boolean isStaticallyBlocked(int r, int c) {
+        if (!inBoundsRC(r, c) || !isWalkable(r, c)) return true;
+        return treeMask[r][c] || buildingMask[r][c];
+    }
+
+    // Avoid diagonal corner-cut if both orthogonal neighbors are blocked
+    private boolean noDiagonalCornerCut(int sr, int sc, int tr, int tc, Unit u) {
+        int dr = Integer.compare(tr, sr), dc = Integer.compare(tc, sc);
+        if (dr != 0 && dc != 0) {
+            // if both adjacent orthogonals are blocked, disallow diagonal step
+            if (isBlocked(sr + dr, sc, u) && isBlocked(sr, sc + dc, u)) return false;
+        }
         return true;
+    }
+
+    // Chebyshev-ring candidates around (destRow, destCol), radius 1..maxRadius
+    private java.util.ArrayList<int[]> collectAltGoalsChebyshev(int destRow, int destCol, int maxRadius) {
+        java.util.ArrayList<int[]> out = new java.util.ArrayList<>();
+        for (int radius = 1; radius <= maxRadius; radius++) {
+            for (int dr = -radius; dr <= radius; dr++) {
+                for (int dc = -radius; dc <= radius; dc++) {
+                    if (dr == 0 && dc == 0) continue;
+                    if (Math.max(Math.abs(dr), Math.abs(dc)) != radius) continue; // ring cells only
+                    int rr = destRow + dr, cc = destCol + dc;
+                    if (!inBoundsRC(rr, cc)) continue;
+                    out.add(new int[]{rr, cc});
+                }
+            }
+            // Optional: break early if we found “enough” nearby goals
+            if (out.size() >= 24) break;
+        }
+        return out;
     }
     // World.java
     public java.util.List<Point> findPath(Unit u, int destRow, int destCol) {

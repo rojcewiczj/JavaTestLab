@@ -12,7 +12,7 @@ public class Wolf extends Actor {
 
     // Vision: wolves can see all around
     @Override public double getVisionRangeTiles() { return 9.0; }
-    @Override public double getVisionConeRad()     { return Math.PI * 2; }
+    @Override public double getVisionConeRad()     { return Math.PI; }
 
     // Ranged: none
     @Override public boolean hasShortBow() { return false; }

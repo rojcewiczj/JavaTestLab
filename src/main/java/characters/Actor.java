@@ -14,7 +14,7 @@ public abstract class Actor {
     private boolean hasSword = true;       // footmen default to sword
     private boolean hasShortBow = false;   // opt-in
     public double getVisionRangeTiles() { return 15.0; }
-    public double getVisionConeRad()    { return Math.toRadians(100); }
+    public double getVisionConeRad()     { return Math.PI; }
 
     // Melee defaults
     public double defaultMeleeCooldown() { return 1.0; };

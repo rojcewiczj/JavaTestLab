@@ -384,7 +384,6 @@ public class WorldPanel extends JPanel {
                 }
             }
         });
-        // --- replace Swing.Timer with this executor loop ---
         java.util.concurrent.ScheduledExecutorService exec =
                 java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
         lastNanos = System.nanoTime();
@@ -393,28 +392,41 @@ public class WorldPanel extends JPanel {
             double dt = Math.min(0.05, (now - lastNanos) / 1_000_000_000.0);
             lastNanos = now;
 
-            // 1) AI first (decide aim, pick paths/targets), then movement (turn+step)
+            // ===== FRAME START =====
+            // 0) Snapshot current occupancy so AI & movement see a consistent world this tick.
+            world.rebuildUnitMask();
+
+            // 1) Decide first (no movement here)
             for (Unit u : world.getUnits()) {
-                u.tickAI(world, dt);  // <-- NEW: AI decides aim/path/target
-                u.update(dt);         // <-- then rotate/move this frame
+                u.tickAI(world, dt);
             }
+
+            // 2) Then move everyone (movement uses isBlockedContinuous & the snapshot above)
+            for (Unit u : world.getUnits()) {
+                u.update(dt);
+            }
+
+            // 3) Despawn/cleanup before we publish the new mask
+            world.cleanupDead();
+
+            // 4) Publish new occupancy for the NEXT frame (and for post-sim systems below)
+            world.rebuildUnitMask();
+
+            // 5) Post-sim systems that want fresh positions/visibility
             world.syncUnitsToLayer();
             world.updateWolfPackSightings();
             world.payIncome(dt);
-//            world.processCombat(now / 1e9);
+            // world.processCombat(now / 1e9); // if you re-enable, keep it AFTER movement
             world.updateArrows(dt);
             world.trySpawnArrivalsForHouses();
             world.updateLumberJobs(dt);
-            world.cleanupDead();
             world.computeVisibility();
 
-            // camera integration
+            // Camera integration
             camVX = approach(camVX, targetVX, panAccel * dt);
             camVY = approach(camVY, targetVY, panAccel * dt);
-            camX = clamp(camX + camVX * dt, 0,
-                    Math.max(0, world.getWidth() * cellSize - viewportW));
-            camY = clamp(camY + camVY * dt, 0,
-                    Math.max(0, world.getHeight() * cellSize - viewportH));
+            camX = clamp(camX + camVX * dt, 0, Math.max(0, world.getWidth() * cellSize - viewportW));
+            camY = clamp(camY + camVY * dt, 0, Math.max(0, world.getHeight() * cellSize - viewportH));
 
             // request a repaint safely on the EDT
             SwingUtilities.invokeLater(this::repaint);
