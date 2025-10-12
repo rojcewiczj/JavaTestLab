@@ -26,7 +26,7 @@ public class WolfAI implements Unit.UnitAI {
     private static final boolean LOG_STATE    = false;
 
     private static final double VIEW = 8.0;                 // wolf vision range (tiles)
-    private static final double BITE_RANGE = 0;           // distance to consider "in bite range"
+    private static final double BITE_RANGE = 1.5;           // distance to consider "in bite range"
     private static final double REPATH_COOLDOWN = 0.45;     // seconds between re-issue path checks
     private static final double PROGRESS_EPS    = 0.04;     // minimal progress threshold
     private static final int    REROLL_AFTER    = 3;        // watchdog: re-pick after N non-progress strikes
@@ -306,7 +306,7 @@ public class WolfAI implements Unit.UnitAI {
                 w.setAimTarget(tgt.getX(), tgt.getY());
 
                 double d = Math.hypot(tgt.getY() - w.getY(), tgt.getX() - w.getX());
-                if (d > BITE_RANGE + 0.25) {
+                if (d > BITE_RANGE ) {
                     state = State.CHASE;
                     break;
                 }
@@ -878,6 +878,7 @@ public class WolfAI implements Unit.UnitAI {
         }
         return claims;
     }
+
 
     private static double dist(double r1,double c1,double r2,double c2){ return Math.hypot(r2-r1, c2-c1); }
     private static double sq(double v){ return v*v; }

@@ -28,9 +28,14 @@ public class World {
 
     // Opaque mask cache (updated when trees/buildings change)
     private final boolean[][] opaque;
+    // --- One-frame move reservations (prevents two units claiming same anchor) ---
+    private int moveStamp = 1;
+    private int[][] resStamp;     // reservation epoch per cell
+    private int[][] resUnitId;    // which unit reserved it this frame
+
     // --- Melee logging controls ---
-    private static final boolean LOG_MELEE = false;   // set true if you want sampled logs
-    private static final double  LOG_MELEE_SAMPLE_P = 0.02; // 2% of events when logging is on
+    private static final boolean LOG_MELEE = true;   // set true if you want sampled logs
+    private static final double  LOG_MELEE_SAMPLE_P = 1.0; // 2% of events when logging is on
 
     // --- (Optional) performance safety budget ---
 // Limit melee resolves per short time window to avoid spikes during feeding frenzies.
@@ -91,6 +96,8 @@ public class World {
         unitStamp    = new int[height][width];
         unitCount    = new short[height][width];
         unitSingleId = new int[height][width];
+        resStamp  = new int[height][width];
+        resUnitId = new int[height][width];
         // IMPORTANT: default to -1 so “single id” logic works even if an id could be 0
         for (int r = 0; r < height; r++) java.util.Arrays.fill(unitSingleId[r], -1);
     }
@@ -264,8 +271,8 @@ public class World {
                         u.setAssignedCamp(den);                // reuse assignedCamp as “den”
                         // If Actor lacks defaults, set here:
                         u.setAimSkill(0);
-                        u.setMeleeSkill(4);
-                        u.setPower(3);
+                        u.setMeleeSkill(9);
+                        u.setPower(9);
                         u.setMaxWounds(2);
                         u.setMeleeCooldownSec(0.8);
                         // wire AI
@@ -1059,7 +1066,7 @@ public class World {
     }
     public void cleanupDead(){
         double now = nowSeconds();
-        units.removeIf(u -> u.isDead() && (now - u.getDeathTimeSec()) >= 30.0);
+        units.removeIf(u -> u.isDead());
     }
     private final java.util.Random rng = new java.util.Random();
 
@@ -1531,7 +1538,30 @@ public class World {
         }
         return false;
     }
+    /** Call once per frame before the movement pass. */
+    public void beginMoveReservations() {
+        moveStamp++;
+        if (moveStamp == Integer.MAX_VALUE) {
+            for (int r = 0; r < resStamp.length; r++) {
+                java.util.Arrays.fill(resStamp[r], 0);
+                java.util.Arrays.fill(resUnitId[r], -1);
+            }
+            moveStamp = 1;
+        }
+    }
 
+    /** Reserve the anchor tile of (y,x) for this unit for the current frame. */
+    public boolean tryReserveAnchor(double y, double x, characters.Unit u) {
+        int r = (int)Math.floor(y);
+        int c = (int)Math.floor(x);
+        if (!inBoundsRC(r, c)) return false;
+        if (resStamp[r][c] != moveStamp) {
+            resStamp[r][c] = moveStamp;
+            resUnitId[r][c] = u.getId();
+            return true;
+        }
+        return resUnitId[r][c] == u.getId(); // allow staying in place
+    }
     // World.java
     public boolean commandMove(Unit u, int destRow, int destCol) {
         // 0) Early exits & fast paths

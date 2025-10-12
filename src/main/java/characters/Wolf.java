@@ -23,8 +23,8 @@ public class Wolf extends Actor {
 
     // Default combat stats
     @Override public int defaultAimSkill() { return 0; }   // no bow
-    @Override public int defaultPower()    { return 3; }   // 30% damage chance
-    @Override public int defaultMeleeSkill(){ return 4; }  // 40% hit chance
+    @Override public int defaultPower()    { return 10; }   // 30% damage chance
+    @Override public int defaultMeleeSkill(){ return 10; }  // 40% hit chance
 
     // Default wounds
     @Override public int defaultMaxWounds() { return 2; }

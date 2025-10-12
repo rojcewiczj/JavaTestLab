@@ -400,10 +400,10 @@ public class WorldPanel extends JPanel {
             for (Unit u : world.getUnits()) {
                 u.tickAI(world, dt);
             }
-
+            world.beginMoveReservations();
             // 2) Then move everyone (movement uses isBlockedContinuous & the snapshot above)
             for (Unit u : world.getUnits()) {
-                u.update(dt);
+                u.update(world, dt);
             }
 
             // 3) Despawn/cleanup before we publish the new mask

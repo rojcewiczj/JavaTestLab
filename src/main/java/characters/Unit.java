@@ -300,8 +300,9 @@ public class Unit {
     }
 
     /** Advance along the path by speed * dt (cells/sec), but always turn toward aim target if set. */
-    public void update(double dt) {
-        // ------------- peek movement waypoint (if any) -------------
+// --- NEW: world-aware update ---
+    public void update(world.World world, double dt) {
+        // ---------- peek movement waypoint ----------
         boolean havePath = moving && !path.isEmpty();
         Point waypoint = null;
         double wx = 0, wy = 0, dx = 0, dy = 0, dist = 0;
@@ -316,29 +317,24 @@ public class Unit {
             if (dist < 1e-6) { dx = dy = 0; }
         }
 
-        // ------------- choose the orientation target -------------
-        // If AI set an aim target (e.g., deer), look at that; otherwise look where we move.
+        // ---------- orientation target ----------
         double desired = orientRad;
         boolean haveMoveDir = havePath && dist > 1e-6;
-        if (aimOverride)           desired = Math.atan2(aimY - y, aimX - x);
-        else if (haveMoveDir)      desired = Math.atan2(dy, dx);
-        // else keep current orientRad
+        if (aimOverride)      desired = Math.atan2(aimY - y, aimX - x);
+        else if (haveMoveDir) desired = Math.atan2(dy, dx);
 
-        // ------------- smooth turn toward desired -------------
         double diff = Math.atan2(Math.sin(desired - orientRad), Math.cos(desired - orientRad));
         double maxStep = turnRateRad * dt;
         if (Math.abs(diff) <= maxStep) orientRad = desired;
         else                           orientRad += Math.copySign(maxStep, diff);
-
         if (orientRad <= -Math.PI) orientRad += 2 * Math.PI;
         if (orientRad >   Math.PI) orientRad -= 2 * Math.PI;
 
-        // ------------- if no path, we're just turning in place -------------
+        // If no path, just update discrete facing and bail
         if (!havePath) {
-            // discrete 8-way facing from smooth orientation
-            double ang = orientRad < 0 ? orientRad + 2 * Math.PI : orientRad;
-            int sector = (int) Math.round(ang / (Math.PI / 4.0)) & 7; // 0..7
-            switch (sector) {
+            double ang0 = orientRad < 0 ? orientRad + 2 * Math.PI : orientRad;
+            int sector0 = (int) Math.round(ang0 / (Math.PI / 4.0)) & 7;
+            switch (sector0) {
                 case 0 -> facing = Facing.E;
                 case 1 -> facing = Facing.SE;
                 case 2 -> facing = Facing.S;
@@ -351,37 +347,71 @@ public class Unit {
             return;
         }
 
-        // ------------- movement speed with strafing slowdown -------------
-        // Slow down only a bit when aiming somewhere different than our move direction.
-        double align = Math.max(0.0, Math.cos(Math.atan2(dy, dx) - orientRad)); // 1 aligned, 0 sideways
-        double k = aimOverride ? 0.35 : 0.85;   // much less slowdown while aiming at a target
-        double minFrac = 0.25;                  // allow decent strafing speed
+        // ---------- movement speed with strafing slowdown ----------
+        double align = Math.max(0.0, Math.cos(Math.atan2(dy, dx) - orientRad));
+        double k = aimOverride ? 0.35 : 0.85;
+        double minFrac = 0.25;
         double speedFrac = Math.max(minFrac, (1 - k) + k * align);
         if (getLength() >= 2) speedFrac *= 0.95 + 0.05 * align;
 
-        // CHANGED: apply wounded/debuff scaling to base movement
         double baseSpeed = actor.getMovement() * movementScale;
+        double step = baseSpeed * speedFrac * dt;
 
-        // CHANGED: use no-turn fallback when we essentially have no move direction
-        double step = haveMoveDir ? (baseSpeed * speedFrac * dt)
-                : (baseSpeed * dt);
-
-        // ------------- waypoint arrival / advancement -------------
-        if (dist < 1e-3 || step >= dist) {
-            x = wx; y = wy;
-            path.removeFirst();
-            if (path.isEmpty()) {
-                moving = false;
-                lastMoveNanos = System.nanoTime();
+        // ---------- waypoint arrival / advancement ----------
+        final double ARRIVE_EPS = 1e-3;
+        if (dist < ARRIVE_EPS || step >= dist) {
+            double nx = wx, ny = wy;
+            // snap to waypoint only if footprint fits AND we can reserve the anchor
+            if (world == null || (!world.isBlockedContinuous(nx, ny, this) && world.tryReserveAnchor(ny, nx, this))) {
+                x = nx; y = ny;
+                path.removeFirst();
+                if (path.isEmpty()) { moving = false; lastMoveNanos = System.nanoTime(); }
+            } else {
+                // couldn’t snap due to block/reservation; fall through to do a normal step below
             }
-        } else {
-            x += (dx / dist) * step;
-            y += (dy / dist) * step;
         }
 
-        // ------------- discrete 8-way facing from smooth orientation -------------
+        // recompute (maybe we still need to move a partial step this frame)
+        if (moving && !path.isEmpty()) {
+            waypoint = path.peekFirst();
+            wx = waypoint.x;  wy = waypoint.y;
+            dx = wx - x;      dy = wy - y;
+            dist = Math.hypot(dx, dy);
+            if (dist > 1e-6) {
+                double ux = dx / dist, uy = dy / dist;
+                double nx = x + ux * Math.min(step, dist);
+                double ny = y + uy * Math.min(step, dist);
+
+                // 1) full step
+                if (!world.isBlockedContinuous(nx, ny, this) && world.tryReserveAnchor(ny, nx, this)) {
+                    x = nx; y = ny;
+                } else {
+                    // 2) axis slides
+                    double nxOnly = x + ux * Math.min(step, dist);
+                    if (!world.isBlockedContinuous(nxOnly, y, this) && world.tryReserveAnchor(y, nxOnly, this)) {
+                        x = nxOnly;
+                    } else {
+                        double nyOnly = y + uy * Math.min(step, dist);
+                        if (!world.isBlockedContinuous(x, nyOnly, this) && world.tryReserveAnchor(nyOnly, x, this)) {
+                            y = nyOnly;
+                        } else {
+                            // 3) blocked: hold this frame
+                        }
+                    }
+                }
+
+                // popped waypoint after moving close enough
+                double rem = Math.hypot(wx - x, wy - y);
+                if (rem <= ARRIVE_EPS) {
+                    path.removeFirst();
+                    if (path.isEmpty()) { moving = false; lastMoveNanos = System.nanoTime(); }
+                }
+            }
+        }
+
+        // ---------- discrete 8-way facing from smooth orientation ----------
         double ang = orientRad < 0 ? orientRad + 2 * Math.PI : orientRad;
-        int sector = (int) Math.round(ang / (Math.PI / 4.0)) & 7; // 0..7
+        int sector = (int) Math.round(ang / (Math.PI / 4.0)) & 7;
         switch (sector) {
             case 0 -> facing = Facing.E;
             case 1 -> facing = Facing.SE;
