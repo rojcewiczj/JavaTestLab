@@ -51,7 +51,7 @@ public class Unit {
     // NEW: path as queue of grid waypoints (row,col)
     private final Deque<Point> path = new ArrayDeque<>();
     // in characters/Unit.java
-    public enum UnitRole { NONE, LUMBER, HUNTER, WOLF }
+    public enum UnitRole { NONE, LUMBER, HUNTER, WOLF, MAN_AT_ARMS, BOW_MAN, HORSE_MAN }
 
     public static enum LumberState {
         SEEK_TREE, MOVE_TO_TREE, CHOPPING, MOVE_TO_CAMP, IDLE

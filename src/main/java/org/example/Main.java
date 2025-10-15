@@ -31,6 +31,13 @@ public class Main {
                 deer.setTeam(Team.NEUTRAL);
                 // no team call — deer stays neutral / teamless per your setup
             }
+            if (!world.isBlocked(r, c, null)) {
+                characters.Unit deer = world.spawnActor(new characters.Deer(), r+2, c);
+                deer.__engine_setLength(2);                 // so it renders with the capsule shape
+                deer.setAI(new intelligence.DeerAI());      // wandering/fleeing brain
+                deer.setTeam(Team.NEUTRAL);
+                // no team call — deer stays neutral / teamless per your setup
+            }
 
             Human archer = Human.basicFootman();
             archer.setName("Archer");
@@ -52,7 +59,7 @@ public class Main {
             // --- NEW: drop a wolf den + 3 wolves somewhere open ---
             // Example: try a few random clear spots near the middle-right
           // 3x3 or 3x4 depending on your Type
-//            world.generateWolfDenAndPack(50, 60);                 // spawns 3 wolves, sets AI with den id
+            world.generateWolfDenAndPack(30, 40);                 // spawns 3 wolves, sets AI with den id
 
             // Control point
 //            world.addControlPoint(new world.ControlPoint(1, 5, 8, 5, 1.5));

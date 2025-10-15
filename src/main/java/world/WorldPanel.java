@@ -1,5 +1,6 @@
 package world;
 import characters.Actor;
+import characters.Team;
 import characters.Unit;
 
 import javax.swing.*;
@@ -27,7 +28,7 @@ public class WorldPanel extends JPanel {
     // ... existing fields ...
     private JButton buildButton;
 
-    private enum BuildMode { NONE, PICK, WALL_PAINT, HOUSE_PLACE, FARM_PLACE, BARN_PLACE, LOGGING_CAMP_PLACE, HUNTING_CAMP_PLACE }
+    private enum BuildMode { NONE, PICK, WALL_PAINT, HOUSE_PLACE, FARM_PLACE, BARN_PLACE, LOGGING_CAMP_PLACE, HUNTING_CAMP_PLACE,  BARRACKS_PLACE, ARCHERY_RANGE_PLACE, STABLE_PLACE }
     private BuildMode buildMode = BuildMode.NONE;
 
     // for wall painting
@@ -88,6 +89,7 @@ public class WorldPanel extends JPanel {
             if (e2 <= dx) { err += dx; y += sy; }
         }
     }
+    // world/World.java
     private int screenToWorldCol(int mx) { return (int) ((mx + camX) / cellSize); }
     private int screenToWorldRow(int my) { return (int) ((my + camY) / cellSize); }
     public WorldPanel(World world, JLabel statusLabel, JButton buildButton,
@@ -145,6 +147,16 @@ public class WorldPanel extends JPanel {
             statusLabel.setText("Place Hunting Camp (3×4): right-click to place. Select a builder first.");
         });
         buildMenu.add(miHuntingCamp);
+        JMenuItem miBarracks = new JMenuItem("Barracks");
+        miBarracks.addActionListener(e -> buildMode = BuildMode.BARRACKS_PLACE);
+        buildMenu.add(miBarracks);
+        buildMenu.add(miHuntingCamp);
+        JMenuItem miArcheryRange = new JMenuItem("ArcheryRange");
+        miArcheryRange.addActionListener(e -> buildMode = BuildMode.ARCHERY_RANGE_PLACE);
+        buildMenu.add(miArcheryRange);
+        JMenuItem miStable = new JMenuItem("Stable");
+        miStable.addActionListener(e -> buildMode = BuildMode.STABLE_PLACE);
+        buildMenu.add(miStable);
         // Show the build palette when clicking the button
         buildButton.addActionListener(e -> {
             if (!buildButton.isEnabled()) return; // safety
@@ -246,6 +258,54 @@ public class WorldPanel extends JPanel {
                             }
                         }
                     }
+                    case BARRACKS_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) {
+                            statusLabel.setText("No builder selected.");
+                            buildMode = BuildMode.NONE;
+                        } else {
+                            if (world.addBarracks(top, left, team)) {
+                                statusLabel.setText("Barracks built.");
+                                buildMode = BuildMode.NONE;
+                                consumed = true;
+                            } else {
+                                statusLabel.setText("Can't place Barracks here.");
+                                buildMode = BuildMode.NONE;
+                            }
+                        }
+                    }
+                    case ARCHERY_RANGE_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) {
+                            statusLabel.setText("No builder selected.");
+                            buildMode = BuildMode.NONE;
+                        } else {
+                            if (world.addArcheryRange(top, left, team)) {
+                                statusLabel.setText("Archery Range built.");
+                                buildMode = BuildMode.NONE;
+                                consumed = true;
+                            } else {
+                                statusLabel.setText("Can't place Archery Range here.");
+                                buildMode = BuildMode.NONE;
+                            }
+                        }
+                    }
+                    case STABLE_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) {
+                            statusLabel.setText("No builder selected.");
+                            buildMode = BuildMode.NONE;
+                        } else {
+                            if (world.addStable(top, left, team)) {
+                                statusLabel.setText("Stable built.");
+                                buildMode = BuildMode.NONE;
+                                consumed = true;
+                            } else {
+                                statusLabel.setText("Can't place Stable here.");
+                                buildMode = BuildMode.NONE;
+                            }
+                        }
+                    }
                     case NONE -> { /* do nothing here; fall through to interaction/move */ }
                 }
 
@@ -274,6 +334,53 @@ public class WorldPanel extends JPanel {
                             updateStatus(row, col);
                             return; // consume click
                         }
+                    }
+                    // === NEW: promote to Man-at-Arms (only if clicked a Barracks) ===
+                    if (selected != null && b != null
+                            && b.getType() == Building.Type.BARRACKS
+                            && selected.getTeam() == b.getTeam()) {
+
+                        // (Optional) gate on “human-like” if you have explicit classes:
+                        // if (!(selected.getActor() instanceof characters.Human)) { /* show error or ignore */ }
+
+                        if (world.promoteToManAtArms(selected, b)) {
+                            statusLabel.setText("Promoted " + selected.getActor().getName() + " to Man-at-Arms.");
+                        } else {
+                            statusLabel.setText("Promotion failed.");
+                        }
+                        updateStatus(row, col);
+                        return; // consume click
+                    }
+                    // === NEW: promote to Man-at-Arms (only if clicked a Barracks) ===
+                    if (selected != null && b != null
+                            && b.getType() == Building.Type.ARCHERY_RANGE
+                            && selected.getTeam() == b.getTeam()) {
+
+                        // (Optional) gate on “human-like” if you have explicit classes:
+                        // if (!(selected.getActor() instanceof characters.Human)) { /* show error or ignore */ }
+
+                        if (world.promoteToBowMan(selected, b)) {
+                            statusLabel.setText("Promoted " + selected.getActor().getName() + " to Bow-Man.");
+                        } else {
+                            statusLabel.setText("Promotion failed.");
+                        }
+                        updateStatus(row, col);
+                        return; // consume click
+                    }
+                    if (selected != null && b != null
+                            && b.getType() == Building.Type.STABLE
+                            && selected.getTeam() == b.getTeam()) {
+
+                        // (Optional) gate on “human-like” if you have explicit classes:
+                        // if (!(selected.getActor() instanceof characters.Human)) { /* show error or ignore */ }
+
+                        if (world.promoteToHorseMan(selected, b)) {
+                            statusLabel.setText("Promoted " + selected.getActor().getName() + " to Horse-Man.");
+                        } else {
+                            statusLabel.setText("Promotion failed.");
+                        }
+                        updateStatus(row, col);
+                        return; // consume click
                     }
 
                     // try mount
@@ -391,37 +498,38 @@ public class WorldPanel extends JPanel {
             long now = System.nanoTime();
             double dt = Math.min(0.05, (now - lastNanos) / 1_000_000_000.0);
             lastNanos = now;
-
             // ===== FRAME START =====
-            // 0) Snapshot current occupancy so AI & movement see a consistent world this tick.
+            // Snapshot current occupancy so AI & movement see a consistent world this tick.
             world.rebuildUnitMask();
 
-            // 1) Decide first (no movement here)
-            for (Unit u : world.getUnits()) {
-                u.tickAI(world, dt);
-            }
-            world.beginMoveReservations();
-            // 2) Then move everyone (movement uses isBlockedContinuous & the snapshot above)
-            for (Unit u : world.getUnits()) {
-                u.update(world, dt);
-            }
 
-            // 3) Despawn/cleanup before we publish the new mask
+            world.updateAllSightings();
+
+            // (B) AI decisions (no movement)
+            for (Unit u : world.getUnits()) u.tickAI(world, dt);
+            world.beginMoveReservations();
+
+            // (C) Movement
+            for (Unit u : world.getUnits()) u.update(world, dt);
+
+            // (D) Cleanup deaths
             world.cleanupDead();
 
-            // 4) Publish new occupancy for the NEXT frame (and for post-sim systems below)
+            // (E) Publish occupancy for NEXT frame & any post-sim systems
             world.rebuildUnitMask();
 
-            // 5) Post-sim systems that want fresh positions/visibility
+            // (Optional) If you want the board to reflect post-move positions immediately for the next frame:
+            // world.updateAllSightings();
+
+            // (F) Player-only render FOV (old computeVisibility; uses playerVisionTeam & writes 'visible')
+            world.computeVisibility();
+
+// 7) The rest (order here isn’t critical for FOV)
             world.syncUnitsToLayer();
-            world.updateWolfPackSightings();
-            world.payIncome(dt);
-            // world.processCombat(now / 1e9); // if you re-enable, keep it AFTER movement
             world.updateArrows(dt);
             world.trySpawnArrivalsForHouses();
             world.updateLumberJobs(dt);
-            world.computeVisibility();
-
+            world.payIncome(dt);
             // Camera integration
             camVX = approach(camVX, targetVX, panAccel * dt);
             camVY = approach(camVY, targetVY, panAccel * dt);
@@ -842,6 +950,24 @@ public class WorldPanel extends JPanel {
                 case LOGGING_CAMP -> new Color(139, 101, 67, 190); // brown-ish for logging
                 case HUNTING_CAMP -> new Color(168, 142, 92, 190);
                 case WOLF_DEN -> new Color(90, 90, 90, 200); // dark grey
+                case BARRACKS -> new Color(
+                        Math.max(0,   base.getRed()   - 25),
+                        Math.min(255, base.getGreen() + 85),
+                        Math.max(0,   base.getBlue()  - 15),
+                        210
+                );
+                case ARCHERY_RANGE -> new Color(
+                        Math.max(0,   base.getRed()   + 25),
+                        Math.min(255, base.getGreen() + 85),
+                        Math.max(0,   base.getBlue()  - 15),
+                        210
+                );
+                case STABLE -> new Color(
+                        Math.max(0,   base.getRed()   + 50),
+                        Math.min(255, base.getGreen() + 85),
+                        Math.max(0,   base.getBlue()  - 15),
+                        210
+                );
             };
 
             g2.setColor(fill);
@@ -860,6 +986,9 @@ public class WorldPanel extends JPanel {
                 case LOGGING_CAMP  -> "LC";
                 case HUNTING_CAMP  -> "HC";
                 case WOLF_DEN -> "WD";// <-- add this
+                case BARRACKS -> "BA";
+                case ARCHERY_RANGE -> "AR";
+                case STABLE -> "ST";
             };
             g2.drawString(label, x + 4, y + 14);
         }

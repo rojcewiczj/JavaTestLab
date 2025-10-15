@@ -2,27 +2,40 @@ package intelligence;
 
 import characters.Team;
 import characters.Unit;
-import world.World;
 
 import java.util.Map;
 import java.util.Random;
 
-/** Wolves hunt like the HunterAI, but with a close-range bite. */
-public class WolfAI implements Unit.UnitAI {
+/**
+ * BowManAI
+ * - Ranged hunter-style logic (approach ring + LOS + aim gating)
+ * - Perception via TeamSightings board (no dependence on render FOV)
+ * - Targets: enemy humans (the other human team) AND wolves
+ *   (e.g., RED bowmen shoot BLUE + WOLF; BLUE bowmen shoot RED + WOLF)
+ *
+ * Assumes world.updateAllSightings() runs before AI each frame.
+ */
+public class BowManAI implements Unit.UnitAI {
 
-    private enum State { INIT, SEARCH, MOVE_TO_BITE, BITE, IDLE }
+    private enum State { INIT, SEARCH, MOVE_TO_SHOT, SHOOT, IDLE }
 
     private final Random rng = new Random();
-    private final int denId; // kept for constructor compatibility (unused by logic)
 
-    // --- Tunables (parity with Hunter, but melee) ---
-    private static final double BITE_RANGE      = 1.5;  // close attack
-    private static final double TRACE_TTL_SEC   = 5.0;  // same as Hunter
-    private static final double SWITCH_MARGIN   = 0.5;  // only switch if strictly closer
-    private static final double ARRIVE_EPS      = 0.6;  // treat as arrived at ring/nav
+    // Ranged tunables (same feel as Hunter)
+    private static final double BOW_RANGE       = 8.0;
+    private static final double TRACE_TTL_SEC   = 5.0;   // governed by board expiry; local expectation
+    private static final double SWITCH_MARGIN   = 0.5;   // switch only if strictly closer than this
+    private static final double ARRIVE_EPS      = 0.6;
 
-    // Aiming / LOS gating (same as Hunter)
-    private static final double AIM_DOT_MIN     = 0.95; // ~18°
+    // Aim/LOS gating (Hunter parity)
+    private static final double AIM_DOT_MIN     = 0.95;
+
+    // Fire cadence
+    private double nextShotAt = 0.0;
+
+    // Target memory ("trace")
+    private Integer targetId = null;
+    private double lastSeenX = 0, lastSeenY = 0;
 
     // Nav watchdog (Hunter parity)
     private int    navTargetR = Integer.MIN_VALUE, navTargetC = Integer.MIN_VALUE;
@@ -30,13 +43,13 @@ public class WolfAI implements Unit.UnitAI {
     private double repathCooldown   = 0.8;
     private double repathTimer      = 0.0;
 
-    // Sticky approach ring (Hunter parity)
+    // Sticky approach ring to reduce jitter
     private boolean haveRing = false;
     private int ringR, ringC;
     private double ringStickTimer = 0.0;
     private static final double RING_STICK_SEC = 1.2;
 
-    // Wander (Hunter parity)
+    // Wander (same controller as Hunter)
     private boolean wandering = false;
     private int    wTarR = Integer.MIN_VALUE, wTarC = Integer.MIN_VALUE;
     private double wPause = 0.0;
@@ -58,19 +71,14 @@ public class WolfAI implements Unit.UnitAI {
     private static final int    WANDER_MAX_NUDGES_PER_LEG        = 2;
     private static final double WANDER_MIN_HEADING_CHANGE_DEG    = 25.0;
 
-    // fields
-    private TargetSelector selector;
-    private Integer targetId = null;
-    private double lastSeenX = 0, lastSeenY = 0;
-
     // State
     private State state = State.INIT;
     private State lastLoggedState = null;
-
     private static final boolean DEBUG = true;
+
     private static String tag(Unit u) {
         String name = (u.getActor()!=null && u.getActor().getName()!=null) ? u.getActor().getName() : ("Unit#"+u.getId());
-        return "[WOLF " + name + " id=" + u.getId() + "]";
+        return "[BOWMAN " + name + " id=" + u.getId() + "]";
     }
     private static String fmt(double v){ return String.format("%.2f", v); }
     private static void log(Unit u, world.World w, String msg){
@@ -83,8 +91,6 @@ public class WolfAI implements Unit.UnitAI {
             log(u, w, "STATE → " + state + (hasTarget()?(" tgt="+targetId):""));
         }
     }
-
-    public WolfAI(int denId) { this.denId = denId; }
 
     // ---------- Small math ----------
     private static double sq(double v){ return v*v; }
@@ -114,30 +120,31 @@ public class WolfAI implements Unit.UnitAI {
         }
     }
 
+    // ---------- Core ----------
     @Override
     public void update(world.World world, Unit u, double dt) {
-        if (selector == null) selector = new TargetSelector(world, TRACE_TTL_SEC, SWITCH_MARGIN);
+        // If you have a BOWMAN role, you can guard here:
+        // if (u.getRole() != Unit.UnitRole.BOWMAN) return;
+
         if (u.isDead()) return;
 
-        // Maintain 5s trace: while active, aim at ACTUAL target position
+        // While we have a target and the team's trace is active, aim toward LIVE position.
         if (hasTarget()) {
-            boolean trace = isTraceActive(world, u);
-            if (trace) {
-                Unit tgt = getNonWolfById(world, targetId);
-                if (tgt != null) u.setAimTarget(tgt.getX(), tgt.getY());
-                else             u.setAimTarget(lastSeenX, lastSeenY);
+            if (isTraceActive(world, u)) {
+                Unit tgt = getHostileById(world, u, targetId);
+                if (tgt != null) {
+                    lastSeenX = tgt.getX(); lastSeenY = tgt.getY();
+                    u.setAimTarget(lastSeenX, lastSeenY);
+                } else {
+                    refreshLastSeenFromBoard(world, u);
+                    u.setAimTarget(lastSeenX, lastSeenY);
+                }
             } else {
                 u.clearAimTarget();
             }
         } else {
             u.clearAimTarget();
         }
-
-        // timers
-        repathTimer   -= dt;
-        wPause        -= dt;
-        wRepathT      -= dt;
-        if (ringStickTimer > 0) ringStickTimer -= dt;
 
         logStateIfChanged(world, u);
 
@@ -151,80 +158,66 @@ public class WolfAI implements Unit.UnitAI {
             }
 
             case SEARCH -> {
-                // 1) Board-driven closest pick (DEER or HUMAN)
-                TargetPick cand = selector.pickClosestFromBoard(u, TargetSelector.WOLF_PREY_TYPES, false);
+                // Prefer sightings from the TEAM board right now (enemy team + wolves)
+                TeamSightings.Sighting spot = pickClosestHostileSighting(world, u);
+                if (spot != null) {
+                    setTargetFromSighting(spot);
 
-                // 2) Switch if better (or none/current stale)
-                if (selector.isBetterThanCurrent(u, targetId, lastSeenX, lastSeenY, cand)) {
-                    selector.adoptPick(new TargetSelector.Adopter() {
-                        @Override public void setTargetId(Integer id) { targetId = id; }
-                        @Override public void setLastSeen(double x, double y) { lastSeenX = x; lastSeenY = y; }
-                    }, cand);
-
-                    u.setAimTarget(lastSeenX, lastSeenY);
-                    haveRing = false; ringStickTimer = 0;
-
-                    if (cand != null && cand.live) {
-                        Unit live = getNonWolfById(world, targetId);
-                        if (live != null && !tryApproachForBite(world, u, live)) {
-                            goToLastSeen(world, u);
-                        }
+                    Unit live = getHostileById(world, u, targetId);
+                    if (live != null) {
+                        u.setAimTarget(live.getX(), live.getY());
+                        if (!tryApproachForShot(world, u, live)) goToLastSeen(world, u);
                     } else {
+                        u.setAimTarget(lastSeenX, lastSeenY);
                         goToLastSeen(world, u);
                     }
-
-                    state = State.MOVE_TO_BITE;
+                    state = State.MOVE_TO_SHOT;
                     logStateIfChanged(world, u);
                     break;
                 }
 
-                // 3) Keep chasing current if its trace is alive
-                if (hasTarget() && selector.isTraceActive(u, targetId)) {
+                // If we already have a target and trace is valid (<5s unseen), pursue it
+                if (hasTarget() && isTraceActive(world, u)) {
                     goToLastSeen(world, u);
-                    state = State.MOVE_TO_BITE;
+                    state = State.MOVE_TO_SHOT;
                     logStateIfChanged(world, u);
                     break;
                 }
 
-                // 4) Meander
+                // Nothing to shoot: meander
                 tickSearchWander(world, u, dt);
             }
 
-            case MOVE_TO_BITE -> {
-                if (!hasTarget()) {
-                    log(u, world, "MOVE_TO_BITE: no target; SEARCH");
-                    clearNavTarget();
-                    state = State.SEARCH; break;
-                }
-                if (!isTraceActive(world, u)) {
-                    log(u, world, "MOVE_TO_BITE: trace expired (" + fmt(traceAgeSec(world, u)) + "s); clearing target");
-                    clearTarget();
-                    clearNavTarget();
-                    state = State.SEARCH; break;
-                }
+            case MOVE_TO_SHOT -> {
+                if (!hasTarget()) { clearNavTarget(); state = State.SEARCH; break; }
+                if (!isTraceActive(world, u)) { clearTarget(); clearNavTarget(); state = State.SEARCH; break; }
 
-                Unit tgt = getNonWolfById(world, targetId);
+                // Coming from SHOOT with no nav? Drop stale ring to force recompute.
+                if (!hasNavTarget()) { haveRing = false; ringStickTimer = 0; }
+
+                Unit tgt = getHostileById(world, u, targetId);
                 if (tgt == null) {
-                    log(u, world, "MOVE_TO_BITE: target missing; SEARCH");
-                    clearTarget();
-                    clearNavTarget();
-                    state = State.SEARCH; break;
+                    refreshLastSeenFromBoard(world, u);
+                    goToLastSeen(world, u);
+                    break;
                 }
                 if (tgt.isDead()) {
                     clearNavTarget();
                     u.clearAimTarget();
                     clearTarget();
-                    state = State.SEARCH; break;
+                    state = State.SEARCH;
+                    break;
                 }
 
                 double d = Math.hypot(tgt.getY() - u.getY(), tgt.getX() - u.getX());
-                if (d <= BITE_RANGE - 0.10) {
+                if (d <= BOW_RANGE - 0.5) {
                     clearNavTarget();
-                    log(u, world, "MOVE_TO_BITE: in range (" + fmt(d) + "), -> BITE");
-                    state = State.BITE; break;
+                    log(u, world, "MOVE_TO_SHOT: in range (" + fmt(d) + "), -> SHOOT");
+                    state = State.SHOOT;
+                    break;
                 }
 
-                // If sticky ring exists, ride it until arrival/expire
+                // Sticky ring ride / arrival
                 if (haveRing && ringStickTimer > 0) {
                     double rcx = ringC + 0.5, rcy = ringR + 0.5;
                     double dnRing = Math.hypot(rcy - u.getY(), rcx - u.getX());
@@ -232,18 +225,21 @@ public class WolfAI implements Unit.UnitAI {
                     if (dnRing <= ARRIVE_EPS) {
                         clearNavTarget();
                         double dNow = Math.hypot(tgt.getY() - u.getY(), tgt.getX() - u.getX());
-                        if (dNow <= BITE_RANGE - 0.10) { state = State.BITE; return; }
-                        // recompute approach
-                        haveRing = false; ringStickTimer = 0;
-                        if (!tryApproachForBite(world, u, tgt)) {
-                            int rr = (int)Math.round(tgt.getY()), cc = (int)Math.round(tgt.getX());
-                            setNavTarget(rr, cc);
-                            if (!world.commandMove(u, rr, cc)) {
-                                var p = world.findPath(u, rr, cc);
-                                if (p != null) u.setPath(p);
+                        if (dNow <= BOW_RANGE - 0.5) {
+                            state = State.SHOOT;
+                            return;
+                        } else {
+                            haveRing = false; ringStickTimer = 0;
+                            if (!tryApproachForShot(world, u, tgt)) {
+                                int rr = (int)Math.round(tgt.getY()), cc = (int)Math.round(tgt.getX());
+                                setNavTarget(rr, cc);
+                                if (!world.commandMove(u, rr, cc)) {
+                                    var p = world.findPath(u, rr, cc);
+                                    if (p != null) u.setPath(p);
+                                }
                             }
+                            return;
                         }
-                        return;
                     } else {
                         if (!hasNavTarget() || navTargetR != ringR || navTargetC != ringC) {
                             setNavTarget(ringR, ringC);
@@ -251,9 +247,9 @@ public class WolfAI implements Unit.UnitAI {
                     }
                 }
 
-                // (Re)plan ring if none or stick expired
+                // No ring or stick expired → (re)plan approach
                 if (!haveRing || ringStickTimer <= 0) {
-                    if (!tryApproachForBite(world, u, tgt)) {
+                    if (!tryApproachForShot(world, u, tgt)) {
                         int rr = (int)Math.round(tgt.getY()), cc = (int)Math.round(tgt.getX());
                         setNavTarget(rr, cc);
                         if (!world.commandMove(u, rr, cc)) {
@@ -271,37 +267,37 @@ public class WolfAI implements Unit.UnitAI {
                 }
             }
 
-            case BITE -> {
-                if (!hasTarget()) { log(u, world, "BITE: no target; SEARCH"); state = State.SEARCH; break; }
-                if (!isTraceActive(world, u)) { log(u, world, "BITE: trace expired; SEARCH"); clearTarget(); state = State.SEARCH; break; }
+            case SHOOT -> {
+                if (!hasTarget()) { state = State.SEARCH; break; }
+                if (!isTraceActive(world, u)) { clearTarget(); state = State.SEARCH; break; }
 
-                Unit tgt = getNonWolfById(world, targetId);
-                if (tgt == null) { log(u, world, "BITE: target missing; SEARCH"); clearTarget(); state = State.SEARCH; break; }
+                Unit tgt = getHostileById(world, u, targetId);
+                if (tgt == null) { clearTarget(); state = State.SEARCH; break; }
                 if (tgt.isDead()) {
                     clearNavTarget();
                     u.clearAimTarget();
                     clearTarget();
-                    state = State.SEARCH; break;
+                    state = State.SEARCH;
+                    break;
                 }
-
                 double d = Math.hypot(tgt.getY()-u.getY(), tgt.getX()-u.getX());
-                boolean losOk = world.hasLineOfSight(u.getRowRounded(), u.getColRounded(),
-                        tgt.getRowRounded(), tgt.getColRounded());
-                if (d > BITE_RANGE - 0.05 || !losOk) {
-                    haveRing = false; ringStickTimer = 0; // recompute approach
-                    log(u, world, "BITE: need reposition (d="+fmt(d)+", los="+losOk+"); -> MOVE_TO_BITE");
-                    state = State.MOVE_TO_BITE; break;
+
+                // If target ran out of range or LOS blocked, immediately pursue again
+                boolean losOk = hasLineOfSight(world, u.getY(), u.getX(), tgt.getY(), tgt.getX());
+                if (d > BOW_RANGE - 0.25 || !losOk) {
+                    haveRing = false; ringStickTimer = 0;
+                    state = State.MOVE_TO_SHOT;
+                    break;
                 }
 
-                // Aim (same gate as bow)
+                // Aim toward target before firing
                 boolean aligned = aimToward(u, tgt.getX(), tgt.getY(), dt);
-                if (!aligned) { log(u, world, "BITE: aligning..."); break; }
+                if (!aligned) break;
 
                 double now = world.nowSeconds();
-                if (now >= u.getNextMeleeAt()) {
-                    world.resolveMeleeHit(u, tgt);
-                    u.setNextMeleeAt(now + u.getMeleeCooldownSec());
-                    log(u, world, "BITE: chomp target "+tgt.getId()+" d="+fmt(d));
+                if (now >= nextShotAt) {
+                    world.fireArrowShot(u, tgt);
+                    nextShotAt = now + u.getRangedCooldownSec();
                 }
             }
 
@@ -309,28 +305,25 @@ public class WolfAI implements Unit.UnitAI {
         }
     }
 
-    /* ---------- Targeting & trace (Hunter parity; non-wolf flavor) ---------- */
+    /* ---------- Board/trace helpers ---------- */
 
     private boolean hasTarget() { return targetId != null; }
 
-    // NanoTime-based trace against the team board
+    // Use nanoTime against the board entry (safe even if expireOld runs separately)
     private boolean isTraceActive(world.World world, Unit me) {
         if (!hasTarget()) return false;
-        var book = world.getSightingsForTeam(me.getTeam());
+        Map<Integer, TeamSightings.Sighting> book = world.getSightingsForTeam(me.getTeam());
         if (book == null) return false;
-        var s = book.get(targetId);
+        TeamSightings.Sighting s = book.get(targetId);
         if (s == null) return false;
         long ageNanos = System.nanoTime() - s.seenNanos;
         return ageNanos <= (long)(TRACE_TTL_SEC * 1e9);
     }
 
-    private double traceAgeSec(world.World world, Unit me){
-        if (!hasTarget()) return Double.POSITIVE_INFINITY;
-        var book = world.getSightingsForTeam(me.getTeam());
-        if (book == null) return Double.POSITIVE_INFINITY;
-        var s = book.get(targetId);
-        if (s == null) return Double.POSITIVE_INFINITY;
-        return (System.nanoTime() - s.seenNanos) / 1e9;
+    private void refreshLastSeenFromBoard(world.World world, Unit me){
+        var book = world.getTeamSightings().view(me.getTeam());
+        var s = (targetId != null) ? book.get(targetId) : null;
+        if (s != null) { lastSeenX = s.x; lastSeenY = s.y; }
     }
 
     private void setTarget(Unit tgt) {
@@ -338,76 +331,59 @@ public class WolfAI implements Unit.UnitAI {
         lastSeenX = tgt.getX(); lastSeenY = tgt.getY();
         haveRing = false;
     }
+
     private void setTargetFromSighting(TeamSightings.Sighting s) {
         targetId = s.unitId;
+        lastSeenX = s.x; lastSeenY = s.y;
         haveRing = false;
     }
+
     private void clearTarget() {
         targetId = null;
         haveRing = false;
     }
 
-    private Unit getNonWolfById(world.World world, Integer id) {
+    /** Hostile = opposite human team (RED<->BLUE) OR WOLF. */
+    private boolean isHostile(Unit me, Unit other) {
+        if (other.getTeam() == Team.WOLF) return true;
+        // treat only RED/BLUE as human teams; ignore NEUTRAL buildings etc.
+        if ((me.getTeam() == Team.RED && other.getTeam() == Team.BLUE) ||
+                (me.getTeam() == Team.BLUE && other.getTeam() == Team.RED)) return true;
+        return false;
+    }
+
+    private Unit getHostileById(world.World world, Unit me, Integer id) {
         if (id == null) return null;
         for (Unit d : world.getUnits()) {
-            if (d.getId() == id && d.getTeam() != Team.WOLF && !d.isDead()) return d;
+            if (d.getId() == id && !d.isDead() && isHostile(me, d)) return d;
         }
         return null;
     }
 
-    // Helper kept for parity: now uses board-based visibility
-    private Unit pickTargetConsideringCloser(world.World world, Unit me) {
-        Unit cur = getNonWolfById(world, targetId);
-        if (cur != null && cur.isDead()) cur = null;
-        boolean curVisible = cur != null && isTeamVisible(world, me, cur);
-
-        Unit best = null; double bestD2 = Double.POSITIVE_INFINITY;
-        for (Unit d : world.getUnits()) {
-            if (d.getTeam() == Team.WOLF || d.isDead()) continue;
-            if (!isTeamVisible(world, me, d)) continue;  // board-based visibility
-            double d2 = sq(d.getY() - me.getY()) + sq(d.getX() - me.getX());
-            if (d2 < bestD2) { bestD2 = d2; best = d; }
-        }
-
-        if (curVisible) {
-            double curD2 = sq(cur.getY() - me.getY()) + sq(cur.getX() - me.getX());
-            if (best == null) return cur;
-            double margin2 = SWITCH_MARGIN * SWITCH_MARGIN;
-            if (best.getId() != cur.getId() && bestD2 + margin2 < curD2) return best;
-            return cur;
-        } else if (best != null) {
-            return best;
-        } else {
-            return null;
-        }
-    }
-
-    private TeamSightings.Sighting pickClosestSighting(world.World world, Unit u) {
-        Map<Integer, TeamSightings.Sighting> book = world.getSightingsForTeam(u.getTeam());
+    /** Board-driven: closest hostile sighting for my team. */
+    private TeamSightings.Sighting pickClosestHostileSighting(world.World world, Unit me) {
+        var book = world.getTeamSightings().view(me.getTeam());
         if (book == null || book.isEmpty()) return null;
         double best = Double.POSITIVE_INFINITY; TeamSightings.Sighting bestS = null;
         for (TeamSightings.Sighting s : book.values()) {
-            // Only consider non-wolf targets from the board
-            Unit maybe = getNonWolfById(world, s.unitId);
-            if (maybe == null) continue;
-            double d2 = sq(s.x - u.getX()) + sq(s.y - u.getY());
+            // Filter: wolves or opposite human team
+            if (s.team != Team.WOLF &&
+                    !((me.getTeam() == Team.RED && s.team == Team.BLUE) ||
+                            (me.getTeam() == Team.BLUE && s.team == Team.RED))) {
+                continue;
+            }
+            double d2 = sq(s.x - me.getX()) + sq(s.y - me.getY());
             if (d2 < best) { best = d2; bestS = s; }
         }
         return bestS;
     }
 
-    // BOARD-BASED team visibility: is the other unit on my team's sightings board?
-    private boolean isTeamVisible(world.World world, Unit me, Unit other) {
-        var book = world.getSightingsForTeam(me.getTeam());
-        return book != null && book.containsKey(other.getId());
-    }
-
-    /* ---------- Melee approach ring (Hunter’s tryApproachForShot adapted for bite) ---------- */
-    private boolean tryApproachForBite(world.World world, Unit u, Unit tgt) {
-        final double desiredR = Math.max(0.7, BITE_RANGE - 0.30); // slightly inside bite range
-        final int samples = 18;
-        final int maxSnap = 3;
-        final double maxAllowed = BITE_RANGE - 0.05;
+    /* ---------- Approach ring (same idea as Hunter) ---------- */
+    private boolean tryApproachForShot(world.World world, Unit u, Unit tgt) {
+        final double desiredR   = Math.max(2.0, BOW_RANGE - 0.75);
+        final int    samples    = 18;
+        final int    maxSnap    = 3;
+        final double maxAllowed = BOW_RANGE - 0.25;
 
         for (int i = 0; i < samples; i++) {
             double ang = (2*Math.PI) * (i + rng.nextDouble()*0.4) / samples;
@@ -421,7 +397,8 @@ public class WolfAI implements Unit.UnitAI {
             int[] snap = findReachableNear(world, u, tr, tc, maxSnap);
             if (snap == null) continue;
 
-            double cx = snap[1] + 0.5, cy = snap[0] + 0.5;
+            double cx = snap[1] + 0.5;
+            double cy = snap[0] + 0.5;
             double dist = Math.hypot(cy - tgt.getY(), cx - tgt.getX());
             if (dist > maxAllowed) continue;
 
@@ -433,20 +410,20 @@ public class WolfAI implements Unit.UnitAI {
 
                 setNavTarget(ringR, ringC);
                 u.setPath(path);
-                if (DEBUG) System.out.println(tag(u)+" ring set ("+ringR+","+ringC+"), dist="+String.format("%.2f",dist));
                 return true;
             }
         }
-        if (DEBUG) System.out.println(tag(u)+" no valid ring found this tick");
         return false;
     }
 
-    // Move toward last known position (exact Hunter parity)
+    /** Move toward last known position (snap to reachable nearby). */
     private void goToLastSeen(world.World world, Unit u) {
         int tr = (int)Math.round(lastSeenY);
         int tc = (int)Math.round(lastSeenX);
+
         int[] dest = findReachableNear(world, u, tr, tc, 5);
         if (dest == null) return;
+
         setNavTarget(dest[0], dest[1]);
         if (!world.commandMove(u, dest[0], dest[1])) {
             var path = world.findPath(u, dest[0], dest[1]);
@@ -587,7 +564,9 @@ public class WolfAI implements Unit.UnitAI {
         }
     }
 
-    /* ---------- Aiming & facing (Hunter parity) ---------- */
+    /* ---------- Aiming & LOS (Hunter parity) ---------- */
+
+    /** Turn toward (tx,ty). Returns true if sufficiently aligned to shoot. */
     private boolean aimToward(Unit u, double tx, double ty, double dt) {
         double desired = Math.atan2(ty - u.getY(), tx - u.getX());
         double cur = u.getOrientRad();
@@ -602,7 +581,7 @@ public class WolfAI implements Unit.UnitAI {
         u.setOrientRad(cur);
 
         double ang = cur < 0 ? cur + 2*Math.PI : cur;
-        int sector = (int) Math.round(ang / (Math.PI/4.0)) & 7;
+        int sector = (int) Math.round(ang / (Math.PI/4.0)) & 7; // 0..7
         switch (sector) {
             case 0 -> u.setFacing(Unit.Facing.E);
             case 1 -> u.setFacing(Unit.Facing.SE);
@@ -617,4 +596,22 @@ public class WolfAI implements Unit.UnitAI {
         double dot = Math.cos(desired - cur);
         return dot >= AIM_DOT_MIN;
     }
+
+    /** Tile LOS (Bresenham). */
+    private boolean hasLineOfSight(world.World world, double r0, double c0, double r1, double c1) {
+        int x0 = (int)Math.floor(c0), y0 = (int)Math.floor(r0);
+        int x1 = (int)Math.floor(c1), y1 = (int)Math.floor(r1);
+        int dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        while (true) {
+            if (world.inBoundsRC(y0, x0) && world.isOpaque(y0, x0)) return false;
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+        return true;
+    }
 }
+

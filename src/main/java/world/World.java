@@ -71,6 +71,11 @@ public class World {
     private characters.Team playerVisionTeam = characters.Team.RED;
 
     public characters.Team getPlayerVisionTeam() { return playerVisionTeam; }
+
+    public TeamSightings getTeamSightings() {
+        return teamSightings;
+    }
+
     private final TeamSightings teamSightings = new TeamSightings();
     // world/World.java
     private final intelligence.PackSightings packSightings = new intelligence.PackSightings(/* ttlNanos= */5_000_000_000L);
@@ -87,10 +92,11 @@ public class World {
     private int[][] unitStamp;      // when cell was last written (== curUnitStamp => valid this frame)
     private short[][] unitCount;    // how many units occupy the cell this frame
     private int[][] unitSingleId;   // the sole unit id if count==1, else -1
-
+    private boolean[][] visScratch;
 
     // call when world is constructed (or whenever size known)
     private void initMasks() {
+        visScratch = new boolean[height][width];
         treeMask     = new boolean[height][width];
         buildingMask = new boolean[height][width];
         unitStamp    = new int[height][width];
@@ -141,6 +147,40 @@ public class World {
         for (int r = top; r < top + 2; r++)
             for (int c = left; c < left + 2; c++)
                 treeMask[r][c] = true;
+    }
+    // Add once:
+    private final java.util.EnumMap<characters.Team, boolean[][]> visByTeam = new java.util.EnumMap<>(characters.Team.class);
+
+    private boolean[][] getVisGrid(characters.Team t) {
+        return visByTeam.computeIfAbsent(t, k -> new boolean[height][width]);
+    }
+
+    // Overload apply to write into a specific grid (leave your old applyUnitFOVShadow(u) as-is if you want)
+    private void applyUnitFOVShadow(characters.Unit u, boolean[][] destVisible) {
+        // your existing shadowcasting, but instead of writing into `visible[r][c]`,
+        // write into `destVisible[r][c]`
+        // ...
+    }
+    /** Compute visibility ONLY for rendering/HUD, using the current playerVisionTeam. */
+    public void computeVisibilityForPlayer() {
+        // 1) clear
+        clear(visible);
+
+        // 2) accumulate FOV of all units on the player's team (or allies if you want)
+        for (characters.Unit u : units) {
+            if (u.getTeam() != playerVisionTeam) continue; // or use isAllied(playerVisionTeam, u.getTeam())
+            applyUnitFOVShadowInto(u, visible);
+        }
+
+        // 3) persist explored (fog of war)
+        for (int r = 0; r < height; r++) {
+            for (int c = 0; c < width; c++) {
+                if (visible[r][c]) explored[r][c] = true;
+            }
+        }
+
+        // 4) optional: feathering for nicer fog edges (your existing function)
+        computeFogFeatherDistances(3);
     }
 
     // replace isTreeAt loop:
@@ -208,6 +248,30 @@ public class World {
     public boolean addHuntingCamp(int top, int left, Team team) {
         if (!canPlaceBuilding(Building.Type.HUNTING_CAMP,top, left)) return false;
         var b = new Building(Building.Type.HUNTING_CAMP, top, left, team);
+        buildings.add(b);
+        stampBuilding(b.getRow(), b.getCol(), b.getType().h, b.getType().w, true);
+//        rebuildOpaqueMask();                 // single rebuild here
+        return true;
+    }
+    public boolean addBarracks(int top, int left, Team team) {
+        if (!canPlaceBuilding(Building.Type.BARRACKS,top, left)) return false;
+        var b = new Building(Building.Type.BARRACKS, top, left, team);
+        buildings.add(b);
+        stampBuilding(b.getRow(), b.getCol(), b.getType().h, b.getType().w, true);
+//        rebuildOpaqueMask();                 // single rebuild here
+        return true;
+    }
+    public boolean addArcheryRange(int top, int left, Team team) {
+        if (!canPlaceBuilding(Building.Type.ARCHERY_RANGE,top, left)) return false;
+        var b = new Building(Building.Type.ARCHERY_RANGE, top, left, team);
+        buildings.add(b);
+        stampBuilding(b.getRow(), b.getCol(), b.getType().h, b.getType().w, true);
+//        rebuildOpaqueMask();                 // single rebuild here
+        return true;
+    }
+    public boolean addStable(int top, int left, Team team) {
+        if (!canPlaceBuilding(Building.Type.STABLE,top, left)) return false;
+        var b = new Building(Building.Type.STABLE, top, left, team);
         buildings.add(b);
         stampBuilding(b.getRow(), b.getCol(), b.getType().h, b.getType().w, true);
 //        rebuildOpaqueMask();                 // single rebuild here
@@ -341,28 +405,212 @@ public class World {
         return hasLineOfSight(sr, sc, tr, tc); // you already use this in ranged combat
     }
     /** Call once per tick before painting. */
-    public void computeVisibility() {
-        // clear current visibility
-        for (int r = 0; r < height; r++) java.util.Arrays.fill(visible[r], false);
+// In world.World
 
-        // Only units on the player’s vision team contribute to visibility
-        for (characters.Unit u : units) {
-            if (u.getTeam() != playerVisionTeam) continue;       // <-- ignore enemies/neutral (e.g., deer)
-            applyUnitFOVShadow(u);
-        }
-
-        // explored := explored OR visible
-        for (int r = 0; r < height; r++)
-            for (int c = 0; c < width;  c++)
-                if (visible[r][c]) explored[r][c] = true;
-        long nowNanos = System.nanoTime();
-// Record deer seen by the PLAYER’s vision team (you already restrict FOV to that team)
-        teamSightings.updateDeerFromVisibility(this, playerVisionTeam, nowNanos);
-        teamSightings.expireOld(playerVisionTeam, nowNanos);
-        // NEW: compute feather distances (blocked by opaque)
-        computeFogFeatherDistances(3); // feather radius in tiles; tweak 2–4
+    private void clear(boolean[][] g){
+        for (int r=0;r<g.length;r++) java.util.Arrays.fill(g[r], false);
     }
 
+    /** Draw a single unit's FOV into the given grid (copy your existing applyUnitFOVShadow body,
+     *  but write into `dest` instead of the global "visible"). */
+    // World.java (inside your World class)
+    private void applyUnitFOVShadowInto(Unit u, boolean[][] dest) {
+        // --- Choose/derive a vision radius (tiles). Replace with your own getter if you have one. ---
+        final int VISION_TILES = 12; // TODO: if you have u.getVisionTiles() or role-based ranges, use that.
+
+        final int ur = u.getRowRounded(); // row (y)
+        final int uc = u.getColRounded(); // col (x)
+
+        // Always mark the unit's own tile as visible for its team
+        if (inBoundsRC(ur, uc)) dest[ur][uc] = true;
+
+        final int rMin = Math.max(0, ur - VISION_TILES);
+        final int rMax = Math.min(getHeight() - 1, ur + VISION_TILES);
+        final int cMin = Math.max(0, uc - VISION_TILES);
+        final int cMax = Math.min(getWidth()  - 1, uc + VISION_TILES);
+
+        final int R2 = VISION_TILES * VISION_TILES;
+
+        // For each tile in a disk around the unit, mark visible if LOS is clear
+        for (int r = rMin; r <= rMax; r++) {
+            int dy = r - ur; int dy2 = dy * dy;
+            for (int c = cMin; c <= cMax; c++) {
+                // skip if already set by another friendly unit
+                if (dest[r][c]) continue;
+
+                int dx = c - uc; int dx2 = dx * dx;
+                if (dx2 + dy2 > R2) continue; // outside circle
+
+                // IMPORTANT: use tile LOS against opaque mask; do NOT use your player-visible[][] here.
+                if (hasLineOfSight(ur, uc, r, c)) {
+                    dest[r][c] = true;
+                }
+            }
+        }
+    }
+    public void updateAllSightings() {
+            for (characters.Team viewer : characters.Team.values()) {
+                clear(visScratch);
+                // build FOV mask for this viewer team
+                int casters = 0;
+                for (characters.Unit u : units) {
+                    if (u.getTeam() != viewer) continue;
+                    applyUnitFOVShadowInto(u, visScratch);
+                    casters++;
+                }
+
+                // 👉 DEBUG: how many tiles are visible to this team this frame?
+                if (true) { // or remove this 'if' to log all teams
+                    int visCount = 0;
+                    for (int rr = 0; rr < visScratch.length; rr++)
+                        for (int cc = 0; cc < visScratch[0].length; cc++)
+                            if (visScratch[rr][cc]) visCount++;
+                    System.out.println("[FOV " + viewer + "] visTiles=" + visCount + " casters=" + casters);
+                }
+
+                long now = System.nanoTime();
+                teamSightings.updateFromVisibility(this, viewer, visScratch, now);
+                teamSightings.expireOld(viewer, now);
+
+                // (your existing board summary print can stay here)
+            }
+        }
+
+
+    private boolean hasAnyUnits(characters.Team t) {
+        for (characters.Unit u : units) if (!u.isDead() && u.getTeam() == t) return true;
+        return false;
+    }
+
+    public void computeVisibility() {
+        // 1) clear current visibility
+        for (int r = 0; r < height; r++) {
+            java.util.Arrays.fill(visible[r], false);
+        }
+
+        // 2) cast FOV from units on the player's vision team
+        characters.Team viewer = (playerVisionTeam != null) ? playerVisionTeam : characters.Team.RED;
+        for (characters.Unit u : units) {
+            if (u.isDead()) continue;
+            if (u.getTeam() != viewer) continue;   // only player team contributes to render FOV
+            applyUnitFOVShadow(u);                 // uses 'visible' internally
+        }
+
+        // 3) explored := explored OR visible
+        for (int r = 0; r < height; r++) {
+            for (int c = 0; c < width; c++) {
+                if (visible[r][c]) explored[r][c] = true;
+            }
+        }
+
+        // optional: keep the soft edge for UI
+        computeFogFeatherDistances(3); // tweak radius to taste
+    }
+    public void updateSightingsForTeam(characters.Team viewerTeam){
+        for (Team viewer : Team.values()) {
+            clear(visScratch);
+            for (Unit u : units) {
+                if (u.getTeam() != viewer) continue; // contributors are only that team
+                applyUnitFOVShadowInto(u, visScratch);
+            }
+            long now = System.nanoTime();
+            teamSightings.updateFromVisibility(this, viewer, visScratch, now); // writes ALL visible types
+            teamSightings.expireOld(viewer, now);
+        }
+    }
+
+    /** Convenience to do all factions that use AI. */
+    public boolean promoteToManAtArms(characters.Unit u, Building b) {
+        if (u == null || b == null) return false;
+        if (u.isDead()) return false;
+        if (b.getType() != Building.Type.BARRACKS) return false;
+        if (u.getTeam() != b.getTeam()) return false;
+
+        // already promoted?
+        if (u.getRole() == characters.Unit.UnitRole.MAN_AT_ARMS) return true;
+
+        // --- Clear any lingering worker/hunter state so it doesn't conflict ---
+        u.setCarryingLog(false);
+        u.setTreeTarget(-1, -1);
+        u.setStandTile(-1, -1);
+        u.setChopTimer(0.0);
+        u.clearHuntLoot();
+        u.clearAimTarget();
+        u.setPath(null); // stops current movement immediately
+
+        // --- Light stat bump (tune to taste) ---
+        u.setMeleeSkill(Math.max(u.getMeleeSkill(), 6));
+        u.setPower(Math.max(u.getPower(), 6));
+        u.setMeleeCooldownSec(Math.min(u.getMeleeCooldownSec(), 0.9));
+
+        // Anchor to this barracks and give new AI
+        u.setAssignedCamp(b);
+        u.setRole(characters.Unit.UnitRole.MAN_AT_ARMS);
+        u.setAI(new intelligence.ManAtArmsAI(b, u.getTeam()));
+        return true;
+    }
+    public boolean promoteToBowMan(characters.Unit u, Building b) {
+        if (u == null || b == null) return false;
+        if (u.isDead()) return false;
+        if (b.getType() != Building.Type.ARCHERY_RANGE) return false;
+        if (u.getTeam() != b.getTeam()) return false;
+
+        // already promoted?
+        if (u.getRole() == Unit.UnitRole.BOW_MAN) return true;
+
+        // --- Clear any lingering worker/hunter state so it doesn't conflict ---
+        u.setCarryingLog(false);
+        u.setTreeTarget(-1, -1);
+        u.setStandTile(-1, -1);
+        u.setChopTimer(0.0);
+        u.clearHuntLoot();
+        u.clearAimTarget();
+        u.setPath(null); // stops current movement immediately
+
+        // --- Light stat bump (tune to taste) ---
+        u.setMeleeSkill(Math.max(u.getMeleeSkill(), 6));
+        u.setPower(Math.max(u.getPower(), 6));
+        u.setMeleeCooldownSec(Math.min(u.getMeleeCooldownSec(), 0.9));
+
+        // Anchor to this barracks and give new AI
+        u.setAssignedCamp(b);
+        u.setRole(Unit.UnitRole.BOW_MAN);
+        u.setAI(new intelligence.BowManAI());
+        return true;
+    }
+    public boolean promoteToHorseMan(characters.Unit u, Building b) {
+        if (u == null || b == null) return false;
+        if (u.isDead()) return false;
+        if (b.getType() != Building.Type.STABLE) return false;
+        if (u.getTeam() != b.getTeam()) return false;
+
+        // already promoted?
+        if (u.getRole() == Unit.UnitRole.HORSE_MAN) return true;
+
+        // --- Clear any lingering worker/hunter state so it doesn't conflict ---
+        u.setCarryingLog(false);
+        u.setTreeTarget(-1, -1);
+        u.setStandTile(-1, -1);
+        u.setChopTimer(0.0);
+        u.clearHuntLoot();
+        u.clearAimTarget();
+        u.setPath(null); // stops current movement immediately
+
+        // --- Light stat bump (tune to taste) ---
+        u.setMeleeSkill(Math.max(u.getMeleeSkill(), 6));
+        u.setPower(Math.max(u.getPower(), 6));
+        u.setMeleeCooldownSec(Math.min(u.getMeleeCooldownSec(), 0.9));
+        u.setMounted(true);
+        u.getActor().setMovement(8);
+        // Anchor to this barracks and give new AI
+        u.setAssignedCamp(b);
+        u.setRole(Unit.UnitRole.HORSE_MAN);
+        u.setAI(new intelligence.HorseManAI());
+        // --- Resize footprint to 2x1 tiles (same as wolves) ---
+        // Use whatever your Unit API uses for wolves. Common patterns:
+        u.__engine_setLength(2);
+        return true;
+    }
     private void computeFogFeatherDistances(int maxSteps) {
         java.util.ArrayDeque<int[]> q = new java.util.ArrayDeque<>();
         // init
@@ -642,6 +890,16 @@ public class World {
     public boolean addLoggingCamp(int topRow, int leftCol, characters.Team team) {
         if (!canPlaceLoggingCamp(topRow, leftCol)) return false;
         Building b = new Building(Building.Type.LOGGING_CAMP, topRow, leftCol, team);
+        buildings.add(b);
+        assignBuildingId(b);
+        // stamp to building mask for collision:
+        stampBuilding(topRow, leftCol, Building.Type.LOGGING_CAMP.h, Building.Type.LOGGING_CAMP.w, true);
+//        rebuildOpaqueMask();
+        return true;
+    }
+    public boolean addMiningCamp(int topRow, int leftCol, characters.Team team) {
+        if (!canPlaceLoggingCamp(topRow, leftCol)) return false;
+        Building b = new Building(Building.Type.MINING_CAMP, topRow, leftCol, team);
         buildings.add(b);
         assignBuildingId(b);
         // stamp to building mask for collision:
