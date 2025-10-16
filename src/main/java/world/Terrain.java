@@ -7,6 +7,10 @@ public class Terrain {
         public final int r, c; // top-left cell
         public TreeBlock(int r, int c) { this.r = r; this.c = c; }
     }
+    public static final class StoneBlock {
+        public final int r, c; // top-left cell
+        public StoneBlock(int r, int c) { this.r = r; this.c = c; }
+    }
 
     // A patch is a set of 2×2 trees + an associated control point id
     public static final class TreePatch {
@@ -14,6 +18,13 @@ public class Terrain {
         private final int controlPointId; // control point placed for this patch
         public TreePatch(int cpId) { this.controlPointId = cpId; }
         public java.util.List<TreeBlock> trees() { return trees; }
+        public int getControlPointId() { return controlPointId; }
+    }
+    public static final class StonePatch {
+        private final java.util.List<StoneBlock> stones = new java.util.ArrayList<>();
+        private final int controlPointId; // control point placed for this patch
+        public StonePatch(int cpId) { this.controlPointId = cpId; }
+        public java.util.List<StoneBlock> stones() { return stones; }
         public int getControlPointId() { return controlPointId; }
     }
 }

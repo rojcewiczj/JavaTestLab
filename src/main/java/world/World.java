@@ -58,12 +58,16 @@ public class World {
     public java.util.List<Building> getBuildings() { return buildings; }
     private final java.util.List<Terrain.TreePatch> treePatches = new java.util.ArrayList<>();
     public java.util.List<Terrain.TreePatch> getTreePatches() { return treePatches; }
+
+    private final java.util.List<Terrain.StonePatch> stonePatches = new java.util.ArrayList<>();
+    public java.util.List<Terrain.StonePatch> getStonePatches() { return stonePatches; }
     public int getFogDist(int r, int c) { return fogDist[r][c]; }
     private boolean[][] buildingMask;  // set true for any building footprint tile
 
     // quick helper: check if a tile is inside any 2×2 tree
     // World.java: fields
     private boolean[][] treeMask;  // [height][width]
+    private boolean[][] stoneMask;
     private int nextBuildingId = 1;
 
     private void assignBuildingId(Building b) { b.__engine_setId(nextBuildingId++); }
@@ -97,6 +101,7 @@ public class World {
     // call when world is constructed (or whenever size known)
     private void initMasks() {
         visScratch = new boolean[height][width];
+        stoneMask     = new boolean[height][width];
         treeMask     = new boolean[height][width];
         buildingMask = new boolean[height][width];
         unitStamp    = new int[height][width];
@@ -187,7 +192,9 @@ public class World {
     private boolean isTreeAt(int r, int c) {
         return treeMask[r][c];
     }
-
+    private boolean isStoneAt(int r, int c) {
+        return stoneMask[r][c];
+    }
     public World(int height, int width, int layers) {
         this.height = height;
         this.width = width;
@@ -219,6 +226,7 @@ public class World {
             for (int c = 0; c < width; c++) {
                 boolean op = false;
                 if (treeMask[r][c]) op = true;
+                if (stoneMask[r][c]) op = true;
                 if (buildingMask[r][c]) {
                     // If you want some buildings (e.g., FARM) not to block, keep a per-cell
                     // building type map. Otherwise, treat any buildingMask as opaque:
@@ -465,7 +473,6 @@ public class World {
                     for (int rr = 0; rr < visScratch.length; rr++)
                         for (int cc = 0; cc < visScratch[0].length; cc++)
                             if (visScratch[rr][cc]) visCount++;
-                    System.out.println("[FOV " + viewer + "] visTiles=" + visCount + " casters=" + casters);
                 }
 
                 long now = System.nanoTime();
@@ -836,6 +843,7 @@ public class World {
             for (int c = leftCol; c < leftCol + type.w; c++) {
                 if (!inBoundsRC(r, c)) return false;
                 if (treeMask != null && treeMask[r][c]) return false;
+                if (stoneMask != null && stoneMask[r][c]) return false;
                 if (buildingMask != null && buildingMask[r][c]) return false;
                 // optional: disallow if a unit currently occupies it
                 // if (isUnitAt(r,c)) return false;
@@ -888,7 +896,7 @@ public class World {
         return true;
     }
     public boolean addLoggingCamp(int topRow, int leftCol, characters.Team team) {
-        if (!canPlaceLoggingCamp(topRow, leftCol)) return false;
+        if (!canPlaceBuilding(Building.Type.LOGGING_CAMP, topRow, leftCol)) return false;
         Building b = new Building(Building.Type.LOGGING_CAMP, topRow, leftCol, team);
         buildings.add(b);
         assignBuildingId(b);
@@ -897,14 +905,12 @@ public class World {
 //        rebuildOpaqueMask();
         return true;
     }
-    public boolean addMiningCamp(int topRow, int leftCol, characters.Team team) {
-        if (!canPlaceLoggingCamp(topRow, leftCol)) return false;
-        Building b = new Building(Building.Type.MINING_CAMP, topRow, leftCol, team);
+    public boolean addMiningCamp(int top, int left, Team team) {
+        if (!canPlaceBuilding(Building.Type.MINING_CAMP,top, left)) return false;
+        var b = new Building(Building.Type.MINING_CAMP, top, left, team);
         buildings.add(b);
-        assignBuildingId(b);
-        // stamp to building mask for collision:
-        stampBuilding(topRow, leftCol, Building.Type.LOGGING_CAMP.h, Building.Type.LOGGING_CAMP.w, true);
-//        rebuildOpaqueMask();
+        stampBuilding(b.getRow(), b.getCol(), b.getType().h, b.getType().w, true);
+//        rebuildOpaqueMask();                 // single rebuild here
         return true;
     }
     // Return all control points that belong to tree patches (forests)
@@ -927,10 +933,37 @@ public class World {
         u.setAssignedCamp(camp);
         u.setRole(characters.Unit.UnitRole.LUMBER);
         u.setCarryingLog(false);
+        u.setCarryingStone(false);
         u.setTreeTarget(-1, -1);
         u.setStandTile(-1, -1);
         u.setChopTimer(0);
         u.setLumberState(characters.Unit.LumberState.SEEK_TREE);
+        return true;
+    }
+    public boolean assignMinerWorker(characters.Unit u, Building camp) {
+        if (camp == null || camp.getType() != Building.Type.MINING_CAMP) return false;
+        if (u == null || u.isDead()) return false;
+        if (u.getTeam() != camp.getTeam()) return false;
+
+        // --- Stop whatever the unit was doing ---
+        u.setPath(null);               // cancel current movement
+        u.clearAimTarget();            // if you have ranged/attack memory
+        u.clearHuntLoot();             // if hunter state exists
+
+        // --- Clear role-specific memories (builder/lumber/etc.) ---
+        u.setCarryingLog(false);
+
+        // --- Clear mining memory & prep fresh job search ---
+        u.setCarryingStone(false);
+        u.setTreeTarget(-1, -1);
+        u.setStoneTarget(-1, -1);      // <<< important
+        u.setStandTile(-1, -1);
+        u.setChopTimer(0.0);
+
+        // --- Switch role & anchor to camp ---
+        u.setAssignedCamp(camp);
+        u.setRole(characters.Unit.UnitRole.MINER);
+        u.setMinerState(Unit.MinerState.SEEK_STONE);
         return true;
     }
     // Search all tree blocks, pick nearest by manhattan/chebyshev, then find an adjacent stand tile
@@ -988,6 +1021,93 @@ public class World {
         if (bestBlock == null) return null;
         return new int[]{bestBlock.r, bestBlock.c, bestStandR, bestStandC};
     }
+    private int[] findNearestStoneAndStand(characters.Unit u) {
+        int ur = u.getRowRounded(), uc = u.getColRounded();
+
+        Terrain.StonePatch bestPatch = null;
+        Terrain.StoneBlock  bestStone = null;
+        int bestDistToStand = Integer.MAX_VALUE; // dist from unit to chosen stand tile
+        int bestDistToStone = Integer.MAX_VALUE; // tiebreaker
+        int bestClumpScore  = -1;                // tiebreaker
+        int bestStandR = -1, bestStandC = -1;
+
+        // Count neighboring stones (8-neighborhood) for “clumpiness”
+        java.util.function.BiFunction<Terrain.StonePatch, Terrain.StoneBlock, Integer> clumpScore = (patch, s) -> {
+            int score = 0;
+            int[][] nn = { {-1,0},{1,0},{0,-1},{0,1},{-1,-1},{-1,1},{1,-1},{1,1} };
+            for (int[] d : nn) {
+                int rr = s.r + d[0], cc = s.c + d[1];
+                for (Terrain.StoneBlock t : patch.stones()) {
+                    if (t.r == rr && t.c == cc) { score++; break; }
+                }
+            }
+            return score;
+        };
+
+        for (Terrain.StonePatch patch : stonePatches) {
+            for (Terrain.StoneBlock s : patch.stones()) {
+                int sr = s.r, sc = s.c;
+
+                // Try orthogonal stands first, then diagonals if none are reachable
+                int[][] ringPrimary   = { {sr-1,sc}, {sr+1,sc}, {sr,sc-1}, {sr,sc+1} };
+                int[][] ringSecondary = { {sr-1,sc-1}, {sr-1,sc+1}, {sr+1,sc-1}, {sr+1,sc+1} };
+
+                int localBestDist = Integer.MAX_VALUE;
+                int localStandR = -1, localStandC = -1;
+
+                // Scan helper body (duplicated to avoid lambda-capture issues)
+                for (int[] rc : ringPrimary) {
+                    int rr = rc[0], cc = rc[1];
+                    if (!inBoundsRC(rr, cc) || isBlocked(rr, cc, u)) continue;
+                    int d = Math.abs(rr - ur) + Math.abs(cc - uc);
+                    if (d < localBestDist) {
+                        var pth = findPathAStar(ur, uc, rr, cc, u);
+                        if (pth != null && !pth.isEmpty()) {
+                            localBestDist = d;
+                            localStandR = rr; localStandC = cc;
+                        }
+                    }
+                }
+                if (localStandR == -1) {
+                    for (int[] rc : ringSecondary) {
+                        int rr = rc[0], cc = rc[1];
+                        if (!inBoundsRC(rr, cc) || isBlocked(rr, cc, u)) continue;
+                        int d = Math.abs(rr - ur) + Math.abs(cc - uc);
+                        if (d < localBestDist) {
+                            var pth = findPathAStar(ur, uc, rr, cc, u);
+                            if (pth != null && !pth.isEmpty()) {
+                                localBestDist = d;
+                                localStandR = rr; localStandC = cc;
+                            }
+                        }
+                    }
+                }
+
+                if (localStandR != -1) {
+                    int dToStand = localBestDist;
+                    int dToStone = Math.abs(sr - ur) + Math.abs(sc - uc);
+                    int clump    = clumpScore.apply(patch, s);
+
+                    boolean better =
+                            (dToStand < bestDistToStand) ||
+                                    (dToStand == bestDistToStand && dToStone < bestDistToStone) ||
+                                    (dToStand == bestDistToStand && dToStone == bestDistToStone && clump > bestClumpScore);
+
+                    if (better) {
+                        bestDistToStand = dToStand;
+                        bestDistToStone = dToStone;
+                        bestClumpScore  = clump;
+                        bestPatch = patch;
+                        bestStone = s;
+                        bestStandR = localStandR; bestStandC = localStandC;
+                    }
+                }
+            }
+        }
+
+        if (bestStone == null) return null;
+        return new int[]{bestStone.r, bestStone.c, bestStandR, bestStandC};
+    }
     private void clearTreeBlock(int top, int left) {
         // clear mask
         for (int rr = top; rr < top+2; rr++)
@@ -999,6 +1119,22 @@ public class World {
             java.util.Iterator<Terrain.TreeBlock> it = patch.trees().iterator();
             while (it.hasNext()) {
                 Terrain.TreeBlock b = it.next();
+                if (b.r == top && b.c == left) { it.remove(); return; }
+            }
+        }
+        // if you pre-render terrain, call invalidateTerrain();
+    }
+    private void clearStoneBlock(int top, int left) {
+        // clear mask
+        for (int rr = top; rr < top+2; rr++)
+            for (int cc = left; cc < left+2; cc++)
+                if (inBoundsRC(rr, cc)) stoneMask[rr][cc] = false;
+
+        // remove from lists
+        for (Terrain.StonePatch patch : stonePatches) {
+            java.util.Iterator<Terrain.StoneBlock> it = patch.stones().iterator();
+            while (it.hasNext()) {
+                Terrain.StoneBlock b = it.next();
                 if (b.r == top && b.c == left) { it.remove(); return; }
             }
         }
@@ -1033,20 +1169,20 @@ public class World {
     }
     public void updateLumberJobs(double dt) {
         for (characters.Unit u : units) {
-            if (u.getRole() != characters.Unit.UnitRole.LUMBER) continue;
+            if (u.getRole() != Unit.UnitRole.LUMBER) continue;
             Building camp = u.getAssignedCamp();
-            if (camp == null) { u.setRole(characters.Unit.UnitRole.NONE); continue; }
+            if (camp == null) { u.setRole(Unit.UnitRole.LUMBER); continue; }
 
             switch (u.getLumberState()) {
 
                 case SEEK_TREE -> {
                     int[] res = findNearestTreeAndStand(u);
-                    if (res == null) { u.setLumberState(characters.Unit.LumberState.IDLE); break; }
+                    if (res == null) { u.setLumberState(Unit.LumberState.IDLE); break; }
                     u.setTreeTarget(res[0], res[1]);
                     u.setStandTile(res[2], res[3]);
                     var path = findPathAStar(u.getRowRounded(), u.getColRounded(), res[2], res[3], u);
-                    if (path != null) { u.setPath(path); u.setLumberState(characters.Unit.LumberState.MOVE_TO_TREE); }
-                    else { u.setLumberState(characters.Unit.LumberState.IDLE); }
+                    if (path != null) { u.setPath(path); u.setLumberState(Unit.LumberState.MOVE_TO_CAMP); }
+                    else { u.setLumberState(Unit.LumberState.IDLE); }
                 }
 
                 case MOVE_TO_TREE -> {
@@ -1055,10 +1191,10 @@ public class World {
                         // ensure still near the same tree (it may have been cut already)
                         int top = u.getTreeTop(), left = u.getTreeLeft();
                         // if tree already gone, seek next
-                        if (!isTreeAt(top, left)) { u.setLumberState(characters.Unit.LumberState.SEEK_TREE); break; }
+                        if (!isTreeAt(top, left)) { u.setLumberState(Unit.LumberState.SEEK_TREE); break; }
                         // start chopping
                         u.setChopTimer(chopDuration(u));
-                        u.setLumberState(characters.Unit.LumberState.CHOPPING);
+                        u.setLumberState(Unit.LumberState.CHOPPING);
                     }
                 }
 
@@ -1095,6 +1231,70 @@ public class World {
             }
         }
     }
+    public void updateMinerJobs(double dt) {
+        for (characters.Unit u : units) {
+            if (u.getRole() != Unit.UnitRole.MINER) continue;
+            Building camp = u.getAssignedCamp();
+            if (camp == null) { u.setRole(Unit.UnitRole.MINER); continue; }
+
+            switch (u.getMinerState()) {
+
+                case SEEK_STONE -> {
+                    int[] res = findNearestStoneAndStand(u);
+                    if (res == null) { u.setMinerState(Unit.MinerState.IDLE); break; }
+                    u.setStoneTarget(res[0], res[1]);
+                    u.setStandTile(res[2], res[3]);
+                    var path = findPathAStar(u.getRowRounded(), u.getColRounded(), res[2], res[3], u);
+                    if (path != null) { u.setPath(path); u.setMinerState(characters.Unit.MinerState.MOVE_TO_STONE); }
+                    else { u.setMinerState(Unit.MinerState.IDLE); }
+                }
+
+                case MOVE_TO_STONE -> {
+                    // when not moving and adjacent to target stand tile, start chopping
+                    if (!u.isMoving()) {
+                        // ensure still near the same tree (it may have been cut already)
+                        int top = u.getStoneTop(), left = u.getStoneLeft();
+                        // if tree already gone, seek next
+                        if (!isStoneAt(top, left)) { u.setMinerState(Unit.MinerState.SEEK_STONE); break; }
+                        // start chopping
+                        u.setChopTimer(chopDuration(u));
+                        u.setMinerState(Unit.MinerState.CHOPPING);
+                    }
+                }
+
+                case CHOPPING -> {
+                    double t = u.getChopTimer() - dt;
+                    if (t > 0) { u.setChopTimer(t); break; }
+
+                    // finished: remove tree, pick up log
+                    int top = u.getStoneTop(), left = u.getStoneLeft();
+                    clearStoneBlock(top, left);
+                    u.setCarryingStone(true);
+
+                    // path to camp drop tile
+                    int[] drop = findCampDropTile(camp, u);
+                    if (drop == null) { u.setMinerState(Unit.MinerState.IDLE); break; }
+                    var path = findPathAStar(u.getRowRounded(), u.getColRounded(), drop[0], drop[1], u);
+                    if (path != null) { u.setPath(path); u.setMinerState(Unit.MinerState.MOVE_TO_CAMP); }
+                    else { u.setMinerState(Unit.MinerState.IDLE); }
+                }
+
+                case MOVE_TO_CAMP -> {
+                    if (!u.isMoving()) {
+                        // deposit stone (you can increment a team stone counter here)
+                        u.setCarryingStone(false);
+                        // immediately seek next tree
+                        u.setMinerState(Unit.MinerState.SEEK_STONE);
+                    }
+                }
+
+                case IDLE -> {
+                    // try again occasionally if there might be trees later
+                    // (no-op here; SEEK_TREE will be set by external trigger or we can retry every few seconds)
+                }
+            }
+        }
+    }
     // Chebyshev distance from a rectangle footprint (top..top+h-1, left..left+w-1)
 // to a single tile (pr,pc). Returns 0 if overlapping, 1 if touching (edge or corner), etc.
     private int chebyshevDistFootprintToPoint(int top, int left, int h, int w, int pr, int pc) {
@@ -1112,26 +1312,29 @@ public class World {
         return Math.max(dr, dc); // 0 = overlap, 1 = touch, 2+ = separated
     }
     // World.java
-    public boolean canPlaceLoggingCamp(int topRow, int leftCol) {
-        // basic blockers
-        if (!canPlaceBuilding(Building.Type.LOGGING_CAMP, topRow, leftCol)) return false;
 
-        // must touch at least one forest CP
-        java.util.List<ControlPoint> cps = forestControlPoints();
-        if (cps.isEmpty()) return false;
+    public boolean assignMiner(characters.Unit u, Building camp) {
+        // Must click a Hunting Camp owned by the same team
+        if (camp == null || camp.getType() != Building.Type.MINING_CAMP) return false;
+        if (u == null || u.getTeam() != camp.getTeam()) return false;
 
-        for (ControlPoint cp : cps) {
-            int d = chebyshevDistFootprintToPoint(
-                    topRow, leftCol,
-                    Building.Type.LOGGING_CAMP.h, Building.Type.LOGGING_CAMP.w,
-                    cp.getRow(), cp.getCol()
-            );
-            if (d == 1) return true;           // touching (edge or diagonal)
-            // (d == 0 would overlap CP tile; we can forbid that)
+        // If this unit was doing something else, clear that
+        interruptForManualControl(u); // safe to call even if not in an AI loop
+
+        // Put them into the hunter loop
+        u.setRole(characters.Unit.UnitRole.MINER);
+        u.setAssignedCamp(camp);
+        u.setHunterState(characters.Unit.HunterState.INIT); // HunterAI will GET_BOW next
+        // Keep hasBow as-is; if they already had one, AI will pass GET_BOW quickly
+        if (u.getAI() == null || !(u.getAI() instanceof intelligence.HunterAI)) {
+            u.setAI(new intelligence.HunterAI());
         }
-        return false;
-    }
 
+        // Optional: stop any current manual path so they immediately start the loop
+        u.setPath(java.util.Collections.emptyList());
+
+        return true;
+    }
     public boolean assignHunter(characters.Unit u, Building camp) {
         // Must click a Hunting Camp owned by the same team
         if (camp == null || camp.getType() != Building.Type.HUNTING_CAMP) return false;
@@ -1765,6 +1968,7 @@ public class World {
         if (!inBoundsRC(r, c) || !isWalkable(r, c)) return true;
 
         // O(1) static blockers
+        if (stoneMask[r][c])     return true;
         if (treeMask[r][c])     return true;
         if (buildingMask[r][c]) return true;
 
@@ -1893,7 +2097,7 @@ public class World {
     // Static terrain/building only — OK to path “toward” a temporarily occupied cell
     private boolean isStaticallyBlocked(int r, int c) {
         if (!inBoundsRC(r, c) || !isWalkable(r, c)) return true;
-        return treeMask[r][c] || buildingMask[r][c];
+        return treeMask[r][c] || stoneMask[r][c] || buildingMask[r][c];
     }
 
     // Avoid diagonal corner-cut if both orthogonal neighbors are blocked
@@ -2012,6 +2216,149 @@ public class World {
                 treePatches.add(patch);
             } else {
                 // no trees placed: remove CP we added
+                controlPoints.remove(cp);
+            }
+        }
+    }
+    // Mark a 1x1 stone tile in the mask
+    private void stampStoneTile(int r, int c) {
+        if (r >= 0 && r < height && c >= 0 && c < width) {
+            stoneMask[r][c] = true;
+        }
+    }
+
+    // --- Stone generation ---
+// Places a central clump per patch, then a few singles with spacing from the clump.
+// attemptsPerPatch ≈ total desired tiles (clump + singles).
+    public void generateStones(int numPatches, int attemptsPerPatch, int corridorsEvery, long seed) {
+        java.util.Random rng = new java.util.Random(seed);
+
+        for (int p = 0; p < numPatches; p++) {
+
+            // 1) choose a rough center
+            int centerR = rng.nextInt(Math.max(1, height));
+            int centerC = rng.nextInt(Math.max(1, width));
+
+            // 2) create a control point (example income 0.7/sec)
+            int cpId = stonePatches.size() + 2000; // separate id space from trees
+            int cpRow = clamp(centerR, 0, height - 1);
+            int cpCol = clamp(centerC, 0, width - 1);
+            ControlPoint cp = new ControlPoint(cpId, cpRow, cpCol, /*radius*/4, /*income*/0.7);
+            addControlPoint(cp);
+
+            Terrain.StonePatch patch = new Terrain.StonePatch(cpId);
+
+            // Targets: mostly clump, some singles
+            int singlesTarget = Math.max(1, attemptsPerPatch / 5);          // ~20% singles
+            int coreTarget    = Math.max(1, attemptsPerPatch - singlesTarget);
+
+            // Helper: corridor exclusion for 1x1 cells
+            java.util.function.BiPredicate<Integer, Integer> blockedByCorridor = (r, c) -> {
+                if (corridorsEvery >= 3) {
+                    if (r % corridorsEvery == 0) return true;
+                    if (c % corridorsEvery == 0) return true;
+                }
+                return false;
+            };
+
+            // Helper: basic validity for stone placement (allow touching other stones for clump)
+            java.util.function.BiPredicate<Integer, Integer> canPlaceCore = (r, c) ->
+                    inBoundsRC(r, c)
+                            && !blockedByCorridor.test(r, c)
+                            && !isStoneAt(r, c)
+                            && buildingAt(r, c) == null
+                            && !isTreeAt(r, c);
+
+            // Helper: stricter validity for singles (enforce spacing from any stone)
+            int singlesSpacing = 2; // at least 1-tile gap around singles (Manhattan/chebyshev window)
+            java.util.function.BiPredicate<Integer, Integer> canPlaceSingle = (r, c) -> {
+                if (!inBoundsRC(r, c)) return false;
+                if (blockedByCorridor.test(r, c)) return false;
+                if (isStoneAt(r, c)) return false;
+                if (buildingAt(r, c) != null) return false;
+                if (isTreeAt(r, c)) return false;
+                // keep a buffer around singles (no stones within radius 1..spacing)
+                for (int rr = r - singlesSpacing; rr <= r + singlesSpacing; rr++) {
+                    for (int cc = c - singlesSpacing; cc <= c + singlesSpacing; cc++) {
+                        if (!inBoundsRC(rr, cc)) continue;
+                        if (isStoneAt(rr, cc)) return false;
+                    }
+                }
+                return true;
+            };
+
+            // 3) Place clump via simple growth from a seed near center
+            int placedCore = 0;
+            // Find a valid seed near center (radius 3 search)
+            int seedR = -1, seedC = -1;
+            searchSeed:
+            for (int rad = 0; rad <= 3; rad++) {
+                for (int dr = -rad; dr <= rad; dr++) {
+                    for (int dc = -rad; dc <= rad; dc++) {
+                        int r = clamp(centerR + dr, 0, height - 1);
+                        int c = clamp(centerC + dc, 0, width - 1);
+                        if (canPlaceCore.test(r, c)) { seedR = r; seedC = c; break searchSeed; }
+                    }
+                }
+            }
+            java.util.ArrayDeque<int[]> frontier = new java.util.ArrayDeque<>();
+            if (seedR != -1) {
+                patch.stones().add(new Terrain.StoneBlock(seedR, seedC));
+                stampStoneTile(seedR, seedC);
+                placedCore++;
+                frontier.add(new int[]{seedR, seedC});
+            }
+
+            // Grow the clump by attaching to existing stones
+            int safety = attemptsPerPatch * 8 + 64; // cap to avoid infinite loops
+            while (placedCore < coreTarget && !frontier.isEmpty() && safety-- > 0) {
+                int[] cur = frontier.peekFirst();
+                // Pick a random neighbor direction order
+                int[][] dirs = { { -1,0 }, { 1,0 }, { 0,-1 }, { 0,1 } };
+                // shuffle tiny array
+                for (int i = 0; i < dirs.length; i++) {
+                    int j = i + rng.nextInt(dirs.length - i);
+                    int[] tmp = dirs[i]; dirs[i] = dirs[j]; dirs[j] = tmp;
+                }
+                boolean placedNeighbor = false;
+                for (int[] d : dirs) {
+                    int nr = cur[0] + d[0], nc = cur[1] + d[1];
+                    if (canPlaceCore.test(nr, nc)) {
+                        patch.stones().add(new Terrain.StoneBlock(nr, nc));
+                        stampStoneTile(nr, nc);
+                        frontier.addLast(new int[]{nr, nc});
+                        placedCore++;
+                        placedNeighbor = true;
+                        break;
+                    }
+                }
+                // if no neighbor placed from this cell, pop it
+                if (!placedNeighbor) frontier.removeFirst();
+            }
+
+            // 4) Place a few singles with spacing from the clump
+            int placedSingles = 0;
+            int singlesSafety = singlesTarget * 12 + 48;
+            int minRing = 3, maxRing = 7; // distance from center for singles
+            while (placedSingles < singlesTarget && singlesSafety-- > 0) {
+                int dr = rng.nextInt(maxRing - minRing + 1) + minRing;
+                int dc = rng.nextInt(maxRing - minRing + 1) + minRing;
+                if (rng.nextBoolean()) dr = -dr;
+                if (rng.nextBoolean()) dc = -dc;
+                int r = clamp(centerR + dr, 0, height - 1);
+                int c = clamp(centerC + dc, 0, width - 1);
+                if (canPlaceSingle.test(r, c)) {
+                    patch.stones().add(new Terrain.StoneBlock(r, c));
+                    stampStoneTile(r, c);
+                    placedSingles++;
+                }
+            }
+
+            int placedTotal = placedCore + placedSingles;
+            if (placedTotal > 0) {
+                stonePatches.add(patch);
+            } else {
+                // nothing placed: remove the CP we added
                 controlPoints.remove(cp);
             }
         }

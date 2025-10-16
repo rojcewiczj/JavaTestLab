@@ -51,10 +51,13 @@ public class Unit {
     // NEW: path as queue of grid waypoints (row,col)
     private final Deque<Point> path = new ArrayDeque<>();
     // in characters/Unit.java
-    public enum UnitRole { NONE, LUMBER, HUNTER, WOLF, MAN_AT_ARMS, BOW_MAN, HORSE_MAN }
+    public enum UnitRole { NONE, LUMBER, MINER, HUNTER, WOLF, MAN_AT_ARMS, BOW_MAN, HORSE_MAN }
 
-    public static enum LumberState {
+    public enum LumberState {
         SEEK_TREE, MOVE_TO_TREE, CHOPPING, MOVE_TO_CAMP, IDLE
+    }
+    public enum MinerState {
+        SEEK_STONE, MOVE_TO_STONE, CHOPPING, MOVE_TO_CAMP, IDLE
     }
     // in characters.Unit (near your LumberState enum)
     public enum HunterState { INIT, GET_BOW, SEARCH, MOVE_TO_SHOT, SHOOT, LOOT, RETURN_TO_CAMP, UNLOAD, IDLE }
@@ -67,9 +70,11 @@ public class Unit {
     private double nextMeleeAt = 0.0;
     private UnitRole role = UnitRole.NONE;
     private LumberState lumberState = LumberState.IDLE;
+    private MinerState minerState = MinerState.IDLE;
     private world.Building assignedCamp;   // Logging camp assigned
     private boolean carryingLog = false;
-
+    private boolean carryingStone = false;
+    private int stoneTop = -1, stoneLeft = -1;
     // target tree (top-left of 2x2)
     private int treeTop = -1, treeLeft = -1;
     // where to stand to chop (adjacent tile)
@@ -279,10 +284,17 @@ public class Unit {
     public void setRole(UnitRole r) { role = r; }
     public LumberState getLumberState() { return lumberState; }
     public void setLumberState(LumberState s) { lumberState = s; }
+    public MinerState getMinerState() { return minerState; }
+    public void setMinerState(MinerState s) { minerState = s; }
     public world.Building getAssignedCamp() { return assignedCamp; }
     public void setAssignedCamp(world.Building b) { assignedCamp = b; }
     public boolean isCarryingLog() { return carryingLog; }
+    public void setCarryingStone(boolean v) { carryingStone = v; }
+    public boolean isCarryingStone() { return carryingStone; }
     public void setCarryingLog(boolean v) { carryingLog = v; }
+    public void setStoneTarget(int top, int left) { stoneTop = top; stoneLeft = left; }
+    public int getStoneTop() { return stoneTop; }
+    public int getStoneLeft() { return stoneLeft; }
     public void setTreeTarget(int top, int left) { treeTop = top; treeLeft = left; }
     public int getTreeTop() { return treeTop; }
     public int getTreeLeft() { return treeLeft; }

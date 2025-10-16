@@ -20,6 +20,7 @@ public class Main {
             World world = new World(100, 160, 2); // bigger map to test camera
             // Generate 5 patches, try 24 blocks each, leave corridor every 4th row/col
             world.generateWoods(10, 24, 2, 12345L);
+            world.generateStones(20, 24, 2, 12345L);
             var horse = world.spawnActor(new Horse(), 6, 6);
             horse.setTeam(Team.RED);
             // spawn a deer using spawnActor (no team set)
@@ -59,7 +60,7 @@ public class Main {
             // --- NEW: drop a wolf den + 3 wolves somewhere open ---
             // Example: try a few random clear spots near the middle-right
           // 3x3 or 3x4 depending on your Type
-            world.generateWolfDenAndPack(30, 40);                 // spawns 3 wolves, sets AI with den id
+//            world.generateWolfDenAndPack(30, 40);                 // spawns 3 wolves, sets AI with den id
 
             // Control point
 //            world.addControlPoint(new world.ControlPoint(1, 5, 8, 5, 1.5));

@@ -28,7 +28,7 @@ public class WorldPanel extends JPanel {
     // ... existing fields ...
     private JButton buildButton;
 
-    private enum BuildMode { NONE, PICK, WALL_PAINT, HOUSE_PLACE, FARM_PLACE, BARN_PLACE, LOGGING_CAMP_PLACE, HUNTING_CAMP_PLACE,  BARRACKS_PLACE, ARCHERY_RANGE_PLACE, STABLE_PLACE }
+    private enum BuildMode { NONE, PICK, WALL_PAINT, HOUSE_PLACE, FARM_PLACE, BARN_PLACE, LOGGING_CAMP_PLACE, MINING_CAMP_PLACE, HUNTING_CAMP_PLACE,  BARRACKS_PLACE, ARCHERY_RANGE_PLACE, STABLE_PLACE }
     private BuildMode buildMode = BuildMode.NONE;
 
     // for wall painting
@@ -146,7 +146,13 @@ public class WorldPanel extends JPanel {
             buildMode = BuildMode.HUNTING_CAMP_PLACE;
             statusLabel.setText("Place Hunting Camp (3×4): right-click to place. Select a builder first.");
         });
-        buildMenu.add(miHuntingCamp);
+        JMenuItem miMiningCamp = new JMenuItem("Mining Camp (3×4)");
+        miMiningCamp.addActionListener(e -> {
+            buildMode = BuildMode.MINING_CAMP_PLACE;
+            statusLabel.setText("Place Mining Camp (3×4): right-click to place. Select a builder first.");
+        });
+        buildMenu.add(miMiningCamp);
+
         JMenuItem miBarracks = new JMenuItem("Barracks");
         miBarracks.addActionListener(e -> buildMode = BuildMode.BARRACKS_PLACE);
         buildMenu.add(miBarracks);
@@ -244,6 +250,14 @@ public class WorldPanel extends JPanel {
                             else { statusLabel.setText("Can't place Logging Camp here (must touch a forest CP and avoid blockers)."); buildMode = BuildMode.NONE; }
                         }
                     }
+                    case MINING_CAMP_PLACE -> {
+                        team = selectedBuilderTeamOrNull();
+                        if (team == null) { statusLabel.setText("No builder selected."); buildMode = BuildMode.NONE; }
+                        else {
+                            if (world.addMiningCamp(top, left, team)) { statusLabel.setText("Mining Camp built."); buildMode = BuildMode.NONE; consumed = true; }
+                            else { statusLabel.setText("Can't place Mining Camp here (must touch a forest CP and avoid blockers)."); buildMode = BuildMode.NONE; }
+                        }
+                    }
                     case HUNTING_CAMP_PLACE -> {
                         team = selectedBuilderTeamOrNull();
                         if (team == null) { statusLabel.setText("No builder selected."); buildMode = BuildMode.NONE; }
@@ -335,6 +349,15 @@ public class WorldPanel extends JPanel {
                             return; // consume click
                         }
                     }
+                    if (selected != null && b != null
+                            && b.getType() == Building.Type.MINING_CAMP
+                            && selected.getTeam() == b.getTeam()) {
+                        if (world.assignMinerWorker(selected, b)) {
+                            statusLabel.setText("Assigned " + selected.getActor().getName() + " as Miner.");
+                            updateStatus(row, col);
+                            return; // consume click
+                        }
+                    }
                     // === NEW: promote to Man-at-Arms (only if clicked a Barracks) ===
                     if (selected != null && b != null
                             && b.getType() == Building.Type.BARRACKS
@@ -382,7 +405,6 @@ public class WorldPanel extends JPanel {
                         updateStatus(row, col);
                         return; // consume click
                     }
-
                     // try mount
                     characters.Unit clicked = world.getUnitAt(row, col);
                     if (selected != null && clicked != null
@@ -529,6 +551,7 @@ public class WorldPanel extends JPanel {
             world.updateArrows(dt);
             world.trySpawnArrivalsForHouses();
             world.updateLumberJobs(dt);
+            world.updateMinerJobs(dt);
             world.payIncome(dt);
             // Camera integration
             camVX = approach(camVX, targetVX, panAccel * dt);
@@ -820,6 +843,19 @@ public class WorldPanel extends JPanel {
                     g2.setColor(new Color(80,55,30,180));
                     g2.drawRoundRect(lx, ly, lw, lh, lh, lh);
                 }
+                // carried stone marker for 1x1 miners (small gray pebble)
+                if (u.getRole() == Unit.UnitRole.MINER && u.isCarryingStone()) {
+                    int sw = Math.max(4, cellSize / 5);
+                    int sh = Math.max(4, cellSize / 5);
+                    // place opposite the log chip (bottom-left of the unit)
+                    int sx = (int) Math.round(cxp) - cellSize/6 - sw/2;
+                    int sy = (int) Math.round(cyp) + cellSize/6 - sh/2;
+
+                    g2.setColor(new Color(136, 140, 150));     // slate gray fill
+                    g2.fillOval(sx, sy, sw, sh);
+                    g2.setColor(new Color(40, 45, 52, 180));   // darker outline
+                    g2.drawOval(sx, sy, sw, sh);
+                }
 
             } else {
                 // centers (continuous) in pixels
@@ -929,6 +965,43 @@ public class WorldPanel extends JPanel {
                 g2.drawRoundRect(x + 1, y + 1, w - 2, h - 2, cellSize, cellSize);
             }
         }
+        // --- Stone ---
+        for (world.Terrain.StonePatch patch : world.getStonePatches()) {
+            // If your type is StoneTile instead of StoneBlock, just change the loop type below.
+            for (world.Terrain.StoneBlock b : patch.stones()) {
+                int x = b.c * cellSize;
+                int y = b.r * cellSize;
+                int w = cellSize, h = cellSize;
+
+                // Slight deterministic variation so clusters don't look identical
+                // (no RNG: varies by cell coords)
+                int var = Math.floorMod(b.r * 31 + b.c * 17, 5);  // 0..4
+                int inset = 2 + (var >= 3 ? 3 : 2);               // 4px or 5px total inset
+                int rx = x + inset, ry = y + inset;
+                int rw = Math.max(2, w - inset * 2);
+                int rh = Math.max(2, h - inset * 2);
+
+                // body
+                g2.setColor(new Color(132, 138, 148, 230));       // slate fill
+                g2.fillOval(rx, ry, rw, rh);
+
+                // subtle edge shadow
+                g2.setColor(new Color(60, 65, 74, 160));
+                g2.drawOval(rx, ry, rw, rh);
+
+                // small highlight (offset varies a bit so clumps feel organic)
+                int hx = rx + Math.max(1, rw / 5) - (var % 2);
+                int hy = ry + Math.max(1, rh / 5) - ((var / 2) % 2);
+                int hw = Math.max(2, rw / 3);
+                int hh = Math.max(2, rh / 3);
+                g2.setColor(new Color(215, 220, 228, 110));
+                g2.fillOval(hx, hy, hw, hh);
+
+                // outline (very subtle)
+                g2.setColor(new Color(25, 25, 30, 140));
+                g2.drawOval(rx, ry, rw, rh);
+            }
+        }
         // --- Buildings ---
         for (world.Building b : world.getBuildings()) {
             int x = b.getCol() * cellSize;
@@ -968,6 +1041,12 @@ public class WorldPanel extends JPanel {
                         Math.max(0,   base.getBlue()  - 15),
                         210
                 );
+                case MINING_CAMP -> new Color(
+                        Math.max(0,   base.getRed()   + 10),
+                        Math.min(255, base.getGreen() + 85),
+                        Math.max(0,   base.getBlue()  - 15),
+                        210
+                );
             };
 
             g2.setColor(fill);
@@ -989,6 +1068,7 @@ public class WorldPanel extends JPanel {
                 case BARRACKS -> "BA";
                 case ARCHERY_RANGE -> "AR";
                 case STABLE -> "ST";
+                case MINING_CAMP -> "MC";
             };
             g2.drawString(label, x + 4, y + 14);
         }
